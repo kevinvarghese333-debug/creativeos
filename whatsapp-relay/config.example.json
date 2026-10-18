@@ -1,6 +1,10 @@
 {
-  // Your own WhatsApp number (the one you chat with Hermes from). Country code, digits only.
-  "owner_number": "91XXXXXXXXXX",
+  // Reference copy. `bash setup.sh` writes the real file to data/whatsapp-relay/config.json
+  // with your answers filled in. Edit that file to change anything below; it reloads by itself.
+  // Numbers: country code + number, digits only (919847012345). A plain 10-digit mobile also works.
+
+  // Your own WhatsApp number (the one you chat with Hermes from).
+  "owner_number": "",
   "timezone": "Asia/Kolkata",
 
   // Keep the agent silent in groups. Leave this true.
@@ -9,13 +13,10 @@
   "forwarding": {
     "enabled": true,
     // The number whose files get forwarded.
-    "source_numbers": ["91XXXXXXXXXX"],
-    // The 3 group IDs. Get each one by typing !groupid inside the group (see the guide).
-    "target_groups": [
-      "1203630XXXXXXXXXXX@g.us",
-      "1203630XXXXXXXXXXX@g.us",
-      "1203630XXXXXXXXXXX@g.us"
-    ],
+    "source_numbers": [],
+    // Normally empty: groups are added by typing !addgroup inside each group (kept in groups.json).
+    // Only paste IDs here (like "120363012345678901@g.us") if !addgroup does not work for a group.
+    "target_groups": [],
     // false = only files (photos, PDFs, documents, videos, voice notes) are forwarded, not plain text.
     "forward_text_messages": false,
     // Optional text put in front of the original caption, e.g. "From office: ". Empty = caption unchanged.
@@ -27,13 +28,13 @@
 
   "statement": {
     "enabled": true,
-    // Numbers that send statement screenshots straight to the bot number (e.g. the firm).
-    // Leave empty if you will forward the screenshots yourself.
+    // The firm's number, which sends statement screenshots straight to the bot.
+    // Empty = only statements you forward yourself (with no caption) are read.
     "sender_numbers": [],
     // The daily credit to look for.
     "expected_amount": 2000,
     "amount_tolerance": 0,
-    // Words that appear in that entry's description, e.g. the last digits of the account or a name.
+    // Words that appear in that entry's description, e.g. the last 4 digits of the account.
     // Empty = every credit of exactly the expected amount counts.
     "match_keywords": [],
     // Screenshots arriving within this many seconds of each other are read together.

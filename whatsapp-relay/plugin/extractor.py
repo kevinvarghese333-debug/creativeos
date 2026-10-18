@@ -13,9 +13,9 @@ import mimetypes
 import os
 from datetime import date
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 MAX_INLINE_BYTES = 18 * 1024 * 1024  # Gemini inline request limit is ~20 MB
 
 RESPONSE_SCHEMA = {
@@ -143,12 +143,12 @@ def parse_response(data: dict) -> dict:
 
 
 async def extract(files: list[tuple[str, Optional[str]]], *, model: str, today: date, hint: str = "",
-                  timeout: float = 120, retries: int = 2) -> dict:
+                  timeout: float = 120, retries: int = 2, base_url: str = "") -> dict:
     key = api_key()
     if not key:
-        raise ExtractionError("No Gemini key found. Add GOOGLE_API_KEY=... to the Hermes .env file.")
+        raise ExtractionError("No Gemini key found. Run `bash setup.sh` again and enter the key.")
     payload = build_payload(files, today=today, hint=hint)
-    url = GEMINI_URL.format(model=model)
+    url = f"{(base_url or GEMINI_BASE_URL).rstrip('/')}/models/{model}:generateContent"
     headers = {"x-goog-api-key": key, "content-type": "application/json"}
 
     import httpx  # shipped with Hermes

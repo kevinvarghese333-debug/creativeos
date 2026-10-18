@@ -19,7 +19,7 @@ import os
 import re
 import sqlite3
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
@@ -30,6 +30,7 @@ WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", 
 DEFAULT_CONFIG: dict[str, Any] = {
     "owner_number": "",
     "timezone": "Asia/Kolkata",
+    "silence_groups": True,
     "forwarding": {
         "enabled": True,
         "source_numbers": [],
@@ -107,11 +108,17 @@ def digits(value: Any) -> str:
     return re.sub(r"\D+", "", str(value or ""))
 
 
-def tz(cfg: dict) -> ZoneInfo:
+IST = timezone(timedelta(hours=5, minutes=30), "IST")
+
+
+def tz(cfg: dict) -> tzinfo:
+    """The configured zone. Without tz data (a slim container image) India falls back to a fixed
+    +05:30, which is exact because India has no daylight saving."""
+    name = cfg.get("timezone") or "Asia/Kolkata"
     try:
-        return ZoneInfo(cfg.get("timezone") or "Asia/Kolkata")
+        return ZoneInfo(name)
     except Exception:
-        return ZoneInfo("Asia/Kolkata")
+        return IST
 
 
 def now_local(cfg: dict) -> datetime:
@@ -429,6 +436,9 @@ class Ledger:
         pending = [d for d in expected if d <= upto and d not in covered and d not in credited_days]
         last_expected = expected[-1] if expected else None
         complete = bool(last_expected) and all(d in covered or d in credited_days for d in expected)
+        # The final total goes out once the month's last working day is in a statement, even when
+        # earlier days never were (setup mid-month); the report lists those days.
+        last_day_in = bool(last_expected) and (last_expected in covered or last_expected in credited_days)
         return {
             "year": year, "month": month, "label": month_name(year, month),
             "total": round(sum(float(r["amount"]) for r in rows), 2),
@@ -439,6 +449,7 @@ class Ledger:
             "missing": missing,
             "pending": pending,
             "complete": complete,
+            "last_day_in": last_day_in,
             "last_expected": last_expected,
         }
 

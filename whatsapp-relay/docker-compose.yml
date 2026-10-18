@@ -1,0 +1,29 @@
+# The WhatsApp relay's own Hermes, separate from every other Hermes on this server.
+#
+# Use `bash setup.sh ...` rather than running docker compose by hand: it also copies the plugin,
+# writes the settings and restarts in the right order.
+#
+#   - Official Hermes image, its own ./data folder (back up the agent by copying ./data).
+#   - No ports opened. Its own Docker network, so the WhatsApp bridge's internal port 3000
+#     cannot clash with another Hermes container on the host.
+#   - Never point a second Hermes container at the same ./data folder.
+name: whatsapp-relay
+
+services:
+  hermes-whatsapp:
+    image: nousresearch/hermes-agent:latest
+    container_name: hermes-whatsapp
+    restart: unless-stopped
+    command: ["gateway", "run"]
+    volumes:
+      - ./data:/opt/data
+    environment:
+      # The container user that owns ./data (setup.sh chowns the files it writes to match).
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      - TZ=Asia/Kolkata
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

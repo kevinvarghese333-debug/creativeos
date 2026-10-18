@@ -1,5 +1,5 @@
 name: whatsapp-relay
-version: "1.0.0"
+version: "1.1.0"
 description: "Forwards files from one WhatsApp number to your groups, and tracks the daily ₹2000 credits from statement screenshots (Gemini reads them, a local ledger keeps the totals)."
 author: "Kev"
 provides_tools:

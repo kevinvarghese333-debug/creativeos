@@ -11,7 +11,7 @@ import logging
 import re
 import shutil
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -21,8 +21,11 @@ from . import ledger as L
 logger = logging.getLogger("whatsapp_relay")
 
 SKIP = "skip"
-PLACEHOLDER_RE = re.compile(r"^\[(?:[a-z_ ]+ received|[a-z_ ]+ could not be downloaded)\]$", re.IGNORECASE)
+PLACEHOLDER_RE = re.compile(r"^\[(?:sticker|[a-z_ ]+ received|[a-z_ ]+ could not be downloaded)\]$", re.IGNORECASE)
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic"}
+GROUP_ID_RE = re.compile(r"^\d+(?:-\d+)?@g\.us$")  # placeholders like 1203630XXXX@g.us don't match
+GROUP_COMMANDS = ("!addgroup", "!removegroup", "!groupid")
+FIRM = "the firm"
 
 HELP_TEXT = """**Relay commands** (send to this number)
 !status - what is set up and this month's total
@@ -32,9 +35,15 @@ HELP_TEXT = """**Relay commands** (send to this number)
 !holidays - list holidays
 !undo - remove the entries from the last statement read
 !retry - read the last failed statement again
+!groups - list the forwarding groups
+!removegroup 2 - stop forwarding to group 2 of that list
 !testgroups - send a test line to the forwarding groups
 !reload - reload config.json after editing it
-!groupid - type this inside a group to get its ID
+
+Typed inside a group (only while `bash setup.sh groups on`):
+!addgroup - forward files to this group
+!removegroup - stop forwarding to this group
+!groupid - show this group's ID
 
 Statement screenshots or PDFs sent here with no caption are read as statements.
 Add a caption to talk to Hermes about an image instead."""
@@ -73,6 +82,21 @@ def platform_name(platform: Any) -> str:
     return str(getattr(platform, "value", platform) or "").lower()
 
 
+def split_commands(text: str) -> list[str]:
+    """WhatsApp batches quick messages into one, so '!status\\n!report' is two commands; a line not
+    starting with '!' continues the command above it."""
+    commands: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("!") or not commands:
+            commands.append(line)
+        else:
+            commands[-1] += " " + line
+    return commands
+
+
 def parse_day(token: str) -> Optional[date]:
     token = token.strip()
     m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", token)
@@ -101,6 +125,7 @@ class Relay:
         self.home = home or L.hermes_home()
         self.data = L.data_dir(self.home)
         self.config_path = self.data / "config.json"
+        self.groups_path = self.data / "groups.json"
         self._config_mtime = None
         self.cfg: dict = {}
         self.ledger: Optional[L.Ledger] = None
@@ -119,8 +144,8 @@ class Relay:
         except OSError:
             self._config_mtime = None
         for g in self.cfg["forwarding"].get("target_groups", []):
-            if not str(g).endswith("@g.us"):
-                logger.warning("[relay] target group %r does not look like a group ID (should end in @g.us)", g)
+            if not GROUP_ID_RE.match(str(g).strip()):
+                logger.warning("[relay] target group %r in config.json is not a group ID (like 1203630...@g.us); ignoring it", g)
 
     def maybe_reload(self) -> None:
         try:
@@ -138,6 +163,57 @@ class Relay:
     def _matches(self, user_id: str, numbers: list) -> bool:
         wanted = {phone(n) for n in numbers if phone(n)}
         return bool(wanted and sender_aliases(user_id) & wanted)
+
+    # ------------------------------------------------------------------ forwarding groups
+    def load_groups(self) -> list[dict]:
+        """Groups added with !addgroup (groups.json)."""
+        try:
+            data = json.loads(self.groups_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError) as exc:
+            logger.warning("[relay] could not read %s: %s", self.groups_path, exc)
+            return []
+        items = data.get("groups") if isinstance(data, dict) else data
+        out = []
+        for g in items or []:
+            if isinstance(g, str):
+                g = {"id": g}
+            if isinstance(g, dict) and GROUP_ID_RE.match(str(g.get("id", "")).strip()):
+                out.append({"id": str(g["id"]).strip(), "name": str(g.get("name") or ""),
+                            "added_at": str(g.get("added_at") or "")})
+        return out
+
+    def save_groups(self, groups: list[dict]) -> None:
+        tmp = self.groups_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"groups": groups}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(self.groups_path)
+
+    def target_groups(self) -> list[dict]:
+        """Where files are forwarded: target_groups from config.json, then the !addgroup groups; one entry per ID."""
+        out, seen = [], set()
+        for gid in self.cfg["forwarding"].get("target_groups", []) or []:
+            gid = str(gid).strip()
+            if GROUP_ID_RE.match(gid) and gid not in seen:
+                seen.add(gid)
+                out.append({"id": gid, "name": "", "source": "config"})
+        for g in self.load_groups():
+            if g["id"] not in seen:
+                seen.add(g["id"])
+                out.append({**g, "source": "added"})
+        return out
+
+    async def group_name(self, chat_id: str, source: Any = None) -> str:
+        """The group's subject from the bridge; "" when it is not known."""
+        adapter = self.adapter(source)
+        if adapter is None:
+            return ""
+        try:
+            info = await adapter.get_chat_info(chat_id)
+        except Exception:
+            return ""
+        name = str((info or {}).get("name") or "").strip()
+        return "" if name in ("", chat_id, chat_id.split("@", 1)[0], "Unknown") else name
 
     # ------------------------------------------------------------------ sending
     def adapter(self, source: Any = None):
@@ -199,10 +275,12 @@ class Relay:
         is_owner = self._matches(user_id, [self.owner])
 
         if is_group:
-            if is_owner and text.strip().lower().startswith("!groupid"):
-                name = getattr(source, "chat_name", None) or raw.get("chatName") or "this group"
-                self.spawn(self.notify_owner(f"Group ID for {name}:\n{chat_id}\n\nPaste it into target_groups in config.json.", source))
-                return {"action": SKIP, "reason": "relay: groupid"}
+            word = text.strip().split()[0].lower() if text.strip() else ""
+            if is_owner and word in GROUP_COMMANDS:
+                self.spawn(self.group_command(word, chat_id, source))
+                return {"action": SKIP, "reason": f"relay: {word[1:]}"}
+            # The chat= ID is what to paste into target_groups if !addgroup ever fails.
+            logger.info("[relay] group message ignored: chat=%s owner=%s", chat_id, is_owner)
             if self.cfg.get("silence_groups", True):
                 return {"action": SKIP, "reason": "relay: group message"}
             return None
@@ -212,7 +290,7 @@ class Relay:
 
         if is_owner:
             if text.strip().startswith("!"):
-                self.spawn(self.run_command(text.strip(), source))
+                self.spawn(self.run_commands(split_commands(text), source))
                 return {"action": SKIP, "reason": "relay: owner command"}
             if stm.get("enabled") and self._is_statement_media(event, raw):
                 caption = self._caption(raw, event)
@@ -227,10 +305,16 @@ class Relay:
 
         if stm.get("enabled") and self._matches(user_id, stm.get("sender_numbers", [])):
             if self._is_statement_media(event, raw):
-                self.queue_statement(event, raw, sender=getattr(source, "user_name", None) or "the firm")
+                self.queue_statement(event, raw, sender=FIRM)
             return {"action": SKIP, "reason": "relay: statement sender"}
 
-        return None  # everyone else: Hermes' own allowlist decides (and stays silent)
+        if user_id.endswith("@s.whatsapp.net"):
+            # Anyone else gets silence, and Hermes never sees it, so you aren't sent an "unrecognized
+            # user" notice for every stranger. An unresolved @lid sender still goes to Hermes' own check.
+            logger.info("[relay] message from an unknown number ignored: chat=%s", chat_id)
+            return {"action": SKIP, "reason": "relay: unknown sender"}
+
+        return None  # an unresolved @lid sender: Hermes' own allowlist decides (and stays silent)
 
     # ------------------------------------------------------------------ helpers
     @staticmethod
@@ -265,7 +349,7 @@ class Relay:
     # ------------------------------------------------------------------ forwarding
     async def forward(self, event: Any, raw: dict, source: Any) -> None:
         fwd = self.cfg["forwarding"]
-        groups = [g for g in fwd.get("target_groups", []) if g]
+        groups = [g["id"] for g in self.target_groups()]
         sender = getattr(source, "user_name", None) or raw.get("senderName") or "source"
         media = self._media(event)
         caption = self._caption(raw, event)
@@ -279,7 +363,8 @@ class Relay:
         adapter = self.adapter(source)
 
         if not groups:
-            await self.notify_owner(f"A message from {sender} arrived but no target_groups are set in config.json, so nothing was forwarded.", source)
+            await self.notify_owner(f"A file from {sender} arrived, but no forwarding groups are set yet, so nothing was forwarded.\n"
+                                    "Run `bash setup.sh groups on`, then type !addgroup inside each group.", source)
             return
         if adapter is None:
             logger.error("[relay] no WhatsApp adapter, cannot forward")
@@ -325,7 +410,7 @@ class Relay:
         mime = (mime or "").lower()
         cap = caption or None
         try:
-            if kind == "image" or (not kind and mime.startswith("image/")):
+            if kind in ("image", "sticker") or (not kind and mime.startswith("image/")):
                 res = await adapter.send_image_file(group, path, caption=cap)
             elif kind in ("video", "gif") or (not kind and mime.startswith("video/")):
                 res = await adapter.send_video(group, path, caption=cap)
@@ -403,10 +488,12 @@ class Relay:
         gem = self.cfg.get("gemini", {})
         try:
             result = await X.extract(batch.files, model=gem.get("model") or "gemini-flash-latest", today=today,
-                                     hint=self.hint(), timeout=float(gem.get("timeout_seconds") or 120))
+                                     hint=self.hint(), timeout=float(gem.get("timeout_seconds") or 120),
+                                     base_url=str(gem.get("base_url") or ""))
         except X.ExtractionError as exc:
             self.last_failed = batch
-            await self.notify_owner(f"⚠️ Couldn't read the statement from {batch.sender} ({len(batch.files)} file{'s' if len(batch.files) != 1 else ''}).\n{exc}\nSend *!retry* to try again.")
+            await self.notify_owner(f"⚠️ Couldn't read the statement from {batch.sender} ({len(batch.files)} file{'s' if len(batch.files) != 1 else ''}).\n{exc}\n"
+                                    "Usually the Gemini key or the free quota. Send *!retry* to try again.")
             return
         except Exception as exc:  # unexpected
             self.last_failed = batch
@@ -559,16 +646,67 @@ class Relay:
             if self.ledger.get_meta(key):
                 continue
             s = self.ledger.month_summary(y, m, today=today)
-            if s["complete"] and s["last_expected"] and s["last_expected"] <= today:
+            if s["last_day_in"] and s["last_expected"] <= today:
                 out.append(self.ledger.month_report(y, m, final=True, today=today))
                 self.ledger.set_meta(key, L.now_local(self.cfg).isoformat())
         return out
 
     # ------------------------------------------------------------------ owner commands
-    async def run_command(self, text: str, source: Any) -> None:
-        reply = await self.command_reply(text)
-        if reply:
-            await self.notify_owner(reply, source)
+    async def run_commands(self, commands: list[str], source: Any) -> None:
+        for text in commands:
+            reply = await self.command_reply(text)
+            if reply:
+                await self.notify_owner(reply, source)
+
+    async def group_command(self, word: str, chat_id: str, source: Any) -> None:
+        """!addgroup / !removegroup / !groupid typed by the owner inside a group. The answer goes to the
+        owner privately; the bot never writes in the group itself."""
+        name = await self.group_name(chat_id, source)
+        label = name or chat_id
+        if word == "!groupid":
+            reply = f"Group ID for {label}:\n{chat_id}"
+        elif word == "!addgroup":
+            groups = self.load_groups()
+            if any(g["id"] == chat_id for g in self.target_groups()):
+                for g in groups:
+                    if g["id"] == chat_id and name and g["name"] != name:
+                        g["name"] = name
+                        self.save_groups(groups)
+                reply = f"✅ {label} is already a forwarding group."
+            else:
+                groups.append({"id": chat_id, "name": name, "added_at": L.now_local(self.cfg).isoformat(timespec="seconds")})
+                self.save_groups(groups)
+                count = len(self.target_groups())
+                reply = f"✅ Added {label}\nFiles from the source number now go to {count} group{'s' if count != 1 else ''}."
+        else:  # !removegroup
+            reply = self._remove_group(chat_id, label)
+        logger.info("[relay] %s in chat=%s (%s)", word, chat_id, label)
+        await self.notify_owner(reply, source)
+
+    def _remove_group(self, chat_id: str, label: str) -> str:
+        groups = self.load_groups()
+        kept = [g for g in groups if g["id"] != chat_id]
+        if len(kept) != len(groups):
+            self.save_groups(kept)
+        if chat_id in [str(g).strip() for g in self.cfg["forwarding"].get("target_groups", [])]:
+            return f"{label} is listed under target_groups in config.json; remove it there to stop forwarding to it."
+        if len(kept) != len(groups):
+            count = len(self.target_groups())
+            return f"Removed {label}. Files now go to {count} group{'s' if count != 1 else ''}."
+        return f"{label} was not a forwarding group."
+
+    async def groups_text(self) -> str:
+        groups = self.target_groups()
+        if not groups:
+            return ("No forwarding groups yet.\nRun `bash setup.sh groups on` on the server, "
+                    "then type !addgroup inside each group.")
+        lines = [f"**Forwarding groups** ({len(groups)})"]
+        for i, g in enumerate(groups, 1):
+            name = await self.group_name(g["id"]) or g.get("name") or "(name unknown)"
+            where = " · in config.json" if g["source"] == "config" else ""
+            lines.append(f"{i}. {name}{where}\n   {g['id']}")
+        lines.append("Stop forwarding to one: !removegroup <number>")
+        return "\n".join(lines)
 
     async def command_reply(self, text: str) -> str:
         parts = text[1:].strip().split()
@@ -615,34 +753,54 @@ class Relay:
         if cmd == "reload":
             self.reload()
             return "Config reloaded.\n\n" + self.status_text(today)
+        if cmd == "groups":
+            return await self.groups_text()
+        if cmd == "removegroup":
+            groups = self.target_groups()
+            if not args or not args[0].isdigit() or not 1 <= int(args[0]) <= len(groups):
+                return "Use !removegroup <number> from the !groups list, or type !removegroup inside the group."
+            g = groups[int(args[0]) - 1]
+            return self._remove_group(g["id"], g.get("name") or await self.group_name(g["id"]) or g["id"])
         if cmd == "testgroups":
-            groups = self.cfg["forwarding"].get("target_groups", [])
+            groups = self.target_groups()
             adapter = self.adapter()
-            if not groups or adapter is None:
-                return "No target_groups set (or WhatsApp not connected)."
+            if not groups:
+                return "No forwarding groups yet. Type !addgroup inside each group first."
+            if adapter is None:
+                return "WhatsApp is not connected, so nothing was sent."
             lines = []
             for g in groups:
+                label = g.get("name") or g["id"]
                 try:
-                    res = await adapter.send(g, "Test message from the file relay. Please ignore.")
+                    res = await adapter.send(g["id"], "Test message from the file relay. Please ignore.")
                     ok = bool(getattr(res, "success", True))
-                    lines.append(f"{'✅' if ok else '❌'} {g}{'' if ok else ' - ' + str(getattr(res, 'error', ''))}")
+                    lines.append(f"{'✅' if ok else '❌'} {label}{'' if ok else ' - ' + str(getattr(res, 'error', ''))}")
                 except Exception as exc:
-                    lines.append(f"❌ {g} - {exc}")
+                    lines.append(f"❌ {label} - {exc}")
             return "Test send:\n" + "\n".join(lines)
-        if cmd == "groupid":
-            return "Type !groupid inside the group itself (the bot number must be a member)."
+        if cmd in ("addgroup", "groupid"):
+            return f"Type !{cmd} inside the group itself (after `bash setup.sh groups on`)."
         return f"Unknown command !{cmd}. Send !help for the list."
 
     def status_text(self, today: date) -> str:
         fwd, stm = self.cfg["forwarding"], self.cfg["statement"]
         last = self.ledger.last_statement_at()
         s = self.ledger.month_summary(today.year, today.month, today=today)
+        groups = self.target_groups()
+        if groups:
+            names = ", ".join(g.get("name") or f"group {i}" for i, g in enumerate(groups, 1))
+            to = f"{len(groups)} group{'s' if len(groups) != 1 else ''} ({names})"
+        else:
+            to = "no groups yet (type !addgroup in each group)"
+        sources = [n for n in (phone(x) for x in fwd.get("source_numbers") or []) if n]
+        firms = [n for n in (phone(x) for x in stm.get("sender_numbers") or []) if n]
         lines = ["**Relay status**",
-                 f"Forwarding: {'on' if fwd.get('enabled') else 'off'} · from {', '.join(fwd.get('source_numbers') or ['(none set)'])} → {len(fwd.get('target_groups') or [])} group(s)",
-                 f"Statements: {'on' if stm.get('enabled') else 'off'} · tracking {L.inr(float(stm['expected_amount'])) if stm.get('expected_amount') else 'any amount'} credits"
-                 + (f" mentioning {', '.join(stm['match_keywords'])}" if stm.get("match_keywords") else ""),
+                 f"Forwarding: {'on' if fwd.get('enabled') else 'off'} · from {', '.join(sources) or '(no source number set)'} → {to}",
+                 f"Statements: {'on' if stm.get('enabled') else 'off'} · read from you" + (f" and {FIRM} ({', '.join(firms)})" if firms else "")
+                 + f" · tracking {L.inr(float(stm['expected_amount'])) if stm.get('expected_amount') else 'any amount'} credits"
+                 + (f" mentioning {', '.join(map(str, stm['match_keywords']))}" if stm.get("match_keywords") else ""),
                  f"Last statement: {last.strftime('%d %b %Y, %I:%M %p') if last else 'none yet'}",
-                 f"{s['label']}: **{L.inr(s['total'])}** from {s['count']} credits"]
+                 f"{s['label']}: **{L.inr(s['total'])}** from {s['count']} credit{'s' if s['count'] != 1 else ''}"]
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ agent tool
