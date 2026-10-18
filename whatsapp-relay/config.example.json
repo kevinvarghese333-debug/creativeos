@@ -1,0 +1,55 @@
+{
+  // Your own WhatsApp number (the one you chat with Hermes from). Country code, digits only.
+  "owner_number": "91XXXXXXXXXX",
+  "timezone": "Asia/Kolkata",
+
+  // Keep the agent silent in groups. Leave this true.
+  "silence_groups": true,
+
+  "forwarding": {
+    "enabled": true,
+    // The number whose files get forwarded.
+    "source_numbers": ["91XXXXXXXXXX"],
+    // The 3 group IDs. Get each one by typing !groupid inside the group (see the guide).
+    "target_groups": [
+      "1203630XXXXXXXXXXX@g.us",
+      "1203630XXXXXXXXXXX@g.us",
+      "1203630XXXXXXXXXXX@g.us"
+    ],
+    // false = only files (photos, PDFs, documents, videos, voice notes) are forwarded, not plain text.
+    "forward_text_messages": false,
+    // Optional text put in front of the original caption, e.g. "From office: ". Empty = caption unchanged.
+    "caption_prefix": "",
+    // "failures" = message you only when a forward fails. "always" = also confirm every forward. "never".
+    "notify_owner": "failures",
+    "delay_between_sends_seconds": 1.5
+  },
+
+  "statement": {
+    "enabled": true,
+    // Numbers that send statement screenshots straight to the bot number (e.g. the firm).
+    // Leave empty if you will forward the screenshots yourself.
+    "sender_numbers": [],
+    // The daily credit to look for.
+    "expected_amount": 2000,
+    "amount_tolerance": 0,
+    // Words that appear in that entry's description, e.g. the last digits of the account or a name.
+    // Empty = every credit of exactly the expected amount counts.
+    "match_keywords": [],
+    // Screenshots arriving within this many seconds of each other are read together.
+    "batch_seconds": 45,
+    "nudge_after_days": 7,
+    "nudge_repeat_days": 2
+  },
+
+  "calendar": {
+    // Days the firm never credits. Holidays can also be added from WhatsApp with !holiday 2026-10-20
+    "weekly_off": ["sunday"],
+    "holidays": []
+  },
+
+  "gemini": {
+    "model": "gemini-flash-latest",
+    "timeout_seconds": 120
+  }
+}
