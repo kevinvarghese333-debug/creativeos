@@ -829,8 +829,8 @@ class Relay:
     async def groups_text(self) -> str:
         groups = self.target_groups()
         if not groups:
-            return ("No forwarding groups yet.\nRun `bash setup.sh groups on` on the server, "
-                    "then type !addgroup inside each group.")
+            return ("No forwarding groups yet.\nRun `bash setup.sh groups` on the server, "
+                    "then type !addgroup inside each group from your phone.")
         lines = [f"**Forwarding groups** ({len(groups)})"]
         for i, g in enumerate(groups, 1):
             name = await self.group_name(g["id"]) or g.get("name") or "(name unknown)"
@@ -914,7 +914,7 @@ class Relay:
                     lines.append(f"❌ {label} - {exc}")
             return "Test send:\n" + "\n".join(lines)
         if cmd in ("addgroup", "groupid"):
-            return f"Type !{cmd} inside the group itself (after `bash setup.sh groups on`)."
+            return f"Type !{cmd} inside the group itself, while `bash setup.sh groups` is running on the server."
         return f"Unknown command !{cmd}. Send !help for the list."
 
     # ------------------------------------------------------------------ settings from WhatsApp
