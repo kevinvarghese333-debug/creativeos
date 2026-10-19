@@ -125,3 +125,73 @@ def test_helper_reports_broken_json(tmp_path):
     r = subprocess.run([sys.executable, str(PKG / "scripts" / "setup_helper.py"), "--data", str(tmp_path), "answers"],
                        capture_output=True, text=True)
     assert r.returncode == 1 and "not valid JSON" in r.stderr
+
+
+# ---------------------------------------------------------------- settings.json in a personal zip
+@pytest.fixture
+def personal_pkg(tmp_path):
+    pkg = tmp_path / "whatsapp-relay"
+    shutil.copytree(PKG / "plugin", pkg / "plugin")
+    shutil.copytree(PKG / "scripts", pkg / "scripts")
+    (pkg / "settings.json").write_text("""{
+      // Kev's settings
+      "owner_number": "9800000001",
+      "forwarding": {"source_numbers": ["919800000002", "919800000003"], "forward_kinds": ["image"],
+                     "target_group_names": ["AREA MANAGERS", "Asst Area Managers", "MANAGERS"]},
+      "statement": {"sender_numbers": ["919800000004"], "accounts": [{"number": "1001", "name": "Asha"}],
+                    "match_keywords": []},
+      "calendar": {"weekly_off": ["sunday"], "holidays": ["2026-10-02"]}
+    }""")
+    return pkg
+
+
+def phelper(pkg, data, *args):
+    r = subprocess.run([sys.executable, str(pkg / "scripts" / "setup_helper.py"), "--data", str(data), *args],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+def test_settings_json_applied_once_then_whatsapp_changes_kept(personal_pkg, tmp_path):
+    data = tmp_path / "data"
+    assert "Applied settings.json" in phelper(personal_pkg, data, "apply-settings")
+    cfg_path = data / "whatsapp-relay" / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    assert cfg["owner_number"] == "9800000001" and cfg["forwarding"]["forward_kinds"] == ["image"]
+    assert cfg["forwarding"]["notify_owner"] == "failures", "defaults are filled in too"
+    summary = phelper(personal_pkg, data, "summary")
+    assert "919800000001" in summary and "919800000002, 919800000003" in summary and "Asha (1001)" in summary
+    assert "AREA MANAGERS, Asst Area Managers, MANAGERS" in summary and "2026-10-02" in summary
+    assert phelper(personal_pkg, data, "answers").startswith("OWNER=919800000001\n")
+
+    cfg["forwarding"]["source_numbers"].append("919800000005")  # as !add source would
+    cfg_path.write_text(json.dumps(cfg))
+    assert phelper(personal_pkg, data, "apply-settings") == "", "an unchanged settings.json is not re-applied"
+    assert "919800000005" in json.loads(cfg_path.read_text())["forwarding"]["source_numbers"]
+
+    (personal_pkg / "settings.json").write_text('{"statement": {"expected_amount": 2500}}')
+    assert "Applied" in phelper(personal_pkg, data, "apply-settings"), "a new settings.json (newer zip) is applied"
+    cfg = json.loads(cfg_path.read_text())
+    assert cfg["statement"]["expected_amount"] == 2500 and "919800000005" in cfg["forwarding"]["source_numbers"]
+
+
+def test_missing_groups_by_name(personal_pkg, tmp_path):
+    data = tmp_path / "data"
+    phelper(personal_pkg, data, "apply-settings")
+    assert phelper(personal_pkg, data, "missing-groups").splitlines() == ["AREA MANAGERS", "Asst Area Managers", "MANAGERS"]
+    (data / "whatsapp-relay" / "groups.json").write_text(json.dumps({"groups": [
+        {"id": "120363000000000001@g.us", "name": "AREA MANAGERS ♻️⚧️"},
+        {"id": "120363000000000003@g.us", "name": "🎯MANAGERS🎯"}]}))
+    assert phelper(personal_pkg, data, "missing-groups").splitlines() == ["Asst Area Managers"]
+    assert phelper(personal_pkg, data, "group-names").count("\n") == 3
+
+
+def test_questions_keep_the_whole_source_list(personal_pkg, tmp_path):
+    data = tmp_path / "data"
+    phelper(personal_pkg, data, "apply-settings")
+    phelper(personal_pkg, data, "save", "--owner", "919800000001", "--source", "919800000002", "--firm", "919800000004")
+    cfg = json.loads((data / "whatsapp-relay" / "config.json").read_text())
+    assert cfg["forwarding"]["source_numbers"] == ["919800000002", "919800000003"]
+    phelper(personal_pkg, data, "save", "--owner", "919800000001", "--source", "919999988888")
+    cfg = json.loads((data / "whatsapp-relay" / "config.json").read_text())
+    assert cfg["forwarding"]["source_numbers"] == ["919999988888"] and cfg["statement"]["sender_numbers"] == []

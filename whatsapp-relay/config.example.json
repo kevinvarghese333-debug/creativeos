@@ -1,6 +1,7 @@
 {
-  // Reference copy. `bash setup.sh` writes the real file to data/whatsapp-relay/config.json
-  // with your answers filled in. Edit that file to change anything below; it reloads by itself.
+  // Reference copy. `bash setup.sh` writes the real file to data/whatsapp-relay/config.json, from
+  // settings.json if the package has one, else from your answers. Change numbers and accounts from
+  // WhatsApp (send !settings to the bot), or edit that file; it reloads by itself.
   // Numbers: country code + number, digits only (919847012345). A plain 10-digit mobile also works.
 
   // Your own WhatsApp number (the one you chat with Hermes from).
@@ -14,9 +15,15 @@
     "enabled": true,
     // The number whose files get forwarded.
     "source_numbers": [],
-    // Normally empty: groups are added by typing !addgroup inside each group (kept in groups.json).
-    // Only paste IDs here (like "120363012345678901@g.us") if !addgroup does not work for a group.
+    // Group names to find by themselves while `bash setup.sh groups` runs, e.g. ["AREA MANAGERS", "MANAGERS"].
+    // Emoji and capitals don't matter. Groups can also be added by typing !addgroup inside them.
+    "target_group_names": [],
+    // Normally empty (found groups are kept in groups.json). Only paste IDs here
+    // (like "120363012345678901@g.us") if a group can't be found or added any other way.
     "target_groups": [],
+    // Which files are forwarded: "image", "document", "video", "audio".
+    // ["image"] = only pictures (a picture sent "as a document" counts as a picture).
+    "forward_kinds": ["image", "document", "video", "audio"],
     // false = only files (photos, PDFs, documents, videos, voice notes) are forwarded, not plain text.
     "forward_text_messages": false,
     // Optional text put in front of the original caption, e.g. "From office: ". Empty = caption unchanged.
@@ -31,6 +38,9 @@
     // The firm's number, which sends statement screenshots straight to the bot.
     // Empty = only statements you forward yourself (with no caption) are read.
     "sender_numbers": [],
+    // Accounts tracked separately when the statements cover more than one, e.g.
+    // [{"number": "1001", "name": "Asha"}, {"number": "1002", "name": "Ravi"}]. Empty = one combined tracker.
+    "accounts": [],
     // The daily credit to look for.
     "expected_amount": 2000,
     "amount_tolerance": 0,

@@ -363,7 +363,8 @@ def test_deposit_tracker_tool(relay, home, gemini):
     gemini.will_return([row(12), row(13)])
     statement_from(relay, home)
     out = relay.tool_summary("2026-10")
-    assert out["total_rupees"] == 4000 and out["credits"] == 2 and "2026-10-12" in out["credited_days"]
+    (acct,) = out["accounts"]
+    assert out["total_rupees_all_accounts"] == 4000 and acct["credits"] == 2 and "2026-10-12" in acct["credited_days"]
 
 
 # ---------------------------------------------------------------- ledger + time

@@ -22,8 +22,12 @@ ships inside the zip.
 ## Build the zip
 
 ```bash
-bash build-zip.sh        # -> dist/whatsapp-relay.zip
+bash build-zip.sh                        # -> dist/whatsapp-relay.zip (setup.sh asks the questions)
+bash build-zip.sh path/to/settings.json  # a personal zip: setup.sh uses those settings, asks only the Gemini key
 ```
+
+A `settings.json` holds someone's phone numbers, groups and accounts in the same shape as
+`config.example.json`. It goes into that person's zip only; `.gitignore` keeps it out of the repo.
 
 ## Tests
 

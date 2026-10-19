@@ -26,6 +26,25 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic"}
 GROUP_ID_RE = re.compile(r"^\d+(?:-\d+)?@g\.us$")  # placeholders like 1203630XXXX@g.us don't match
 GROUP_COMMANDS = ("!addgroup", "!removegroup", "!groupid")
 FIRM = "the firm"
+CLEAR_WORDS = {"none", "off", "clear", "-"}
+# !set / !add / !remove <name> ... -> where the value lives in config.json
+SETTINGS = {
+    "source": ("forwarding", "source_numbers"),
+    "firm": ("statement", "sender_numbers"),
+    "keyword": ("statement", "match_keywords"),
+    "account": ("statement", "accounts"),
+    "amount": ("statement", "expected_amount"),
+}
+SETTING_ALIASES = {"sources": "source", "firms": "firm", "keywords": "keyword", "accounts": "account"}
+SET_USAGE = """Change settings by sending:
+!add source 9847012345 - another number whose reports get forwarded
+!remove source 9847012345 - stop forwarding from that number
+!set firm 9847012345 - who sends the statements (or !set firm none)
+!add account 1001 Asha - track another account separately
+!remove account 1001 - stop tracking it
+!set keyword 4417 - a word the entry must contain (or !set keyword none)
+!set amount 2000 - the daily credit to look for
+(!set replaces the whole list; separate several with commas.)"""
 
 HELP_TEXT = """**Relay commands** (send to this number)
 !status - what is set up and this month's total
@@ -38,6 +57,7 @@ HELP_TEXT = """**Relay commands** (send to this number)
 !groups - list the forwarding groups
 !removegroup 2 - stop forwarding to group 2 of that list
 !testgroups - send a test line to the forwarding groups
+!settings - the numbers, accounts and amount in use, and how to change them
 !reload - reload config.json after editing it
 
 Typed inside a group (only while `bash setup.sh groups on`):
@@ -130,9 +150,11 @@ class Relay:
         self.cfg: dict = {}
         self.ledger: Optional[L.Ledger] = None
         self.gateway = None
+        self.whatsapp_adapter = None  # the adapter that handed us the latest message
         self.batches: dict[str, Batch] = {}
         self.last_failed: Optional[Batch] = None
         self.tasks: set[asyncio.Task] = set()
+        self._groups_checked: set[str] = set()  # group chats already looked up by name this run
         self.reload()
 
     # ------------------------------------------------------------------ config
@@ -203,6 +225,29 @@ class Relay:
                 out.append({**g, "source": "added"})
         return out
 
+    def missing_group_names(self) -> list[str]:
+        """target_group_names with no matching forwarding group yet."""
+        have = {L.group_key(g.get("name")) for g in self.target_groups()}
+        return [n for n in self.cfg["forwarding"].get("target_group_names") or [] if L.group_key(n) not in have]
+
+    async def find_named_group(self, chat_id: str, source: Any = None) -> None:
+        """A message arrived in a group: if its name is one of target_group_names, start forwarding there."""
+        if any(g["id"] == chat_id for g in self.target_groups()):
+            return
+        name = await self.group_name(chat_id, source)
+        wanted = {L.group_key(n): n for n in self.cfg["forwarding"].get("target_group_names") or []}
+        if not name or L.group_key(name) not in wanted:
+            return
+        groups = self.load_groups()
+        groups.append({"id": chat_id, "name": name, "added_at": L.now_local(self.cfg).isoformat(timespec="seconds")})
+        self.save_groups(groups)
+        missing = self.missing_group_names()
+        total = len(wanted)
+        logger.info("[relay] found group %s: chat=%s", name, chat_id)
+        reply = f"✅ Found {name} ({total - len(missing)} of {total}). Reports will be forwarded there."
+        reply += f"\nStill looking for: {', '.join(missing)}" if missing else "\nAll groups found."
+        await self.notify_owner(reply, source)
+
     async def group_name(self, chat_id: str, source: Any = None) -> str:
         """The group's subject from the bridge; "" when it is not known."""
         adapter = self.adapter(source)
@@ -219,7 +264,7 @@ class Relay:
     def adapter(self, source: Any = None):
         gw = self.gateway
         if gw is None:
-            return None
+            return self.whatsapp_adapter
         if source is not None:
             try:
                 found = gw._intake_adapter_for(source)
@@ -230,7 +275,7 @@ class Relay:
         for key, adapter in (getattr(gw, "adapters", None) or {}).items():
             if platform_name(key) == "whatsapp":
                 return adapter
-        return None
+        return self.whatsapp_adapter
 
     async def notify_owner(self, text: str, source: Any = None) -> bool:
         adapter = self.adapter(source)
@@ -258,11 +303,16 @@ class Relay:
             logger.error("[relay] background task failed: %r", task.exception())
 
     # ------------------------------------------------------------------ entry point
-    async def handle(self, event: Any, gateway: Any) -> Optional[dict]:
+    async def handle(self, event: Any, gateway: Any, adapter: Any = None) -> Optional[dict]:
+        """``gateway`` comes with the gateway hook, ``adapter`` with the adapter intercept; either is
+        enough to send replies. Returns {"action": "skip"} when the relay handled the message."""
         source = getattr(event, "source", None)
         if source is None or platform_name(getattr(source, "platform", "")) != "whatsapp":
             return None
-        self.gateway = gateway
+        if gateway is not None:
+            self.gateway = gateway
+        if adapter is not None:
+            self.whatsapp_adapter = adapter
         self.maybe_reload()
         if not self.owner:
             return None  # not configured yet
@@ -279,6 +329,9 @@ class Relay:
             if is_owner and word in GROUP_COMMANDS:
                 self.spawn(self.group_command(word, chat_id, source))
                 return {"action": SKIP, "reason": f"relay: {word[1:]}"}
+            if self.cfg["forwarding"].get("target_group_names") and chat_id not in self._groups_checked:
+                self._groups_checked.add(chat_id)
+                self.spawn(self.find_named_group(chat_id, source))
             # The chat= ID is what to paste into target_groups if !addgroup ever fails.
             logger.info("[relay] group message ignored: chat=%s owner=%s", chat_id, is_owner)
             if self.cfg.get("silence_groups", True):
@@ -361,6 +414,10 @@ class Relay:
         kind = str(raw.get("mediaType") or "").lower()
         file_name = raw.get("fileName") or None
         adapter = self.adapter(source)
+        allowed = {str(k).lower() for k in fwd.get("forward_kinds") or []}
+        if media and allowed and file_category(kind, media) not in allowed:
+            logger.info("[relay] %s from %s not forwarded (forward_kinds: %s)", file_category(kind, media), sender, sorted(allowed))
+            return
 
         if not groups:
             await self.notify_owner(f"A file from {sender} arrived, but no forwarding groups are set yet, so nothing was forwarded.\n"
@@ -480,6 +537,10 @@ class Relay:
             parts.append(f"The owner mainly tracks regular credits of about ₹{stm['expected_amount']}.")
         if stm.get("match_keywords"):
             parts.append("Those entries usually mention: " + ", ".join(map(str, stm["match_keywords"])) + ".")
+        accounts = L.tracked_accounts(self.cfg)
+        if accounts:
+            parts.append("The statements are usually for account " + " or ".join(a["number"] for a in accounts)
+                         + "; give each row the account number from its own statement's header.")
         parts.append("Still list every row, not only those.")
         return "\n" + " ".join(parts)
 
@@ -536,7 +597,11 @@ class Relay:
             if d > today + timedelta(days=1) or d < today - timedelta(days=400):
                 rejected.append(t)  # date misread (wrong year etc.)
                 continue
-            valid.append({**t, "date": d, "amount": amount,
+            try:
+                img = int(t.get("image") or 1)
+            except (TypeError, ValueError):
+                img = 1
+            valid.append({**t, "date": d, "amount": amount, "image": img,
                           "description": str(t.get("description") or "").strip(),
                           "reference": str(t.get("reference") or "").strip()})
         if valid:
@@ -550,52 +615,92 @@ class Relay:
             return {"not_statement": not result.get("is_statement", False), "empty": True,
                     "notes": result.get("notes") or "", "rejected": len(rejected)}
 
-        # What the statement shows = the date span visible on each screenshot/page (rows carry their
-        # image number), so a page that was not sent never counts as "checked, no credit".
-        by_image: dict[int, list[date]] = {}
-        for t in valid:
-            try:
-                img = int(t.get("image") or 1)
-            except (TypeError, ValueError):
-                img = 1
-            by_image.setdefault(img, []).append(t["date"])
-        ranges = sorted((min(ds), min(max(ds), today)) for ds in by_image.values())
-        merged: list[tuple[date, date]] = []
-        for a, b in ranges:
-            if merged and a <= merged[-1][1] + timedelta(days=1):
-                merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        # Which tracked account each row belongs to: its own printed account, else the one most rows on
+        # the same screenshot carry, else the only tracked account. "" = accounts are not tracked separately.
+        accounts = self.ledger.accounts()
+        other_accounts: set[str] = set()
+        if accounts:
+            per_image: dict[int, dict[str, int]] = {}
+            for t in valid:
+                t["acct"] = L.match_account(t.get("account"), accounts)
+                if t["acct"]:
+                    votes = per_image.setdefault(t["image"], {})
+                    votes[t["acct"]] = votes.get(t["acct"], 0) + 1
+                elif L.account_key(t.get("account")):
+                    other_accounts.add(L.account_key(t.get("account")))
+            for t in valid:
+                if t["acct"] is None and not L.account_key(t.get("account")):
+                    votes = per_image.get(t["image"])
+                    t["acct"] = max(votes, key=votes.get) if votes else (accounts[0]["number"] if len(accounts) == 1 else None)
+        else:
+            for t in valid:
+                t["acct"] = ""
+        unattributed = [t for t in valid if t["acct"] is None and not L.account_key(t.get("account"))]
+        tracked = [t for t in valid if t["acct"] is not None]
+
+        # What the statement shows = the date span visible on each screenshot/page, per account, so a page
+        # that was not sent never counts as "checked, no credit".
+        spans: dict[tuple[int, str], list[date]] = {}
+        for t in tracked:
+            spans.setdefault((t["image"], t["acct"]), []).append(t["date"])
+        merged: dict[str, list[tuple[date, date]]] = {}
+        for (_, acct), ds in sorted(spans.items(), key=lambda kv: min(kv[1])):
+            a, b = min(ds), min(max(ds), today)
+            runs = merged.setdefault(acct, [])
+            if runs and a <= runs[-1][1] + timedelta(days=1):
+                runs[-1] = (runs[-1][0], max(runs[-1][1], b))
             else:
-                merged.append((a, b))
-        dates = [t["date"] for t in valid]
-        covered_from, covered_to = merged[0][0], merged[-1][1]
+                runs.append((a, b))
+        all_runs = [r for runs in merged.values() for r in runs]
+        covered_from = min((a for a, _ in all_runs), default=min(t["date"] for t in valid))
+        covered_to = max((b for _, b in all_runs), default=max(t["date"] for t in valid))
 
         ledger = self.ledger
         sid = ledger.add_statement(sender=sender, files=files, covered_from=covered_from, covered_to=covered_to,
-                                   transactions=len(valid), raw=result, ranges=merged)
+                                   transactions=len(valid), raw=result,
+                                   ranges=[(a, b, acct) for acct, runs in merged.items() for a, b in runs])
         matched, seen = [], set()
-        for t in valid:
+        for t in tracked:
             if not self.matches(t):
                 continue
-            k = ledger.dedupe_key(t["date"], t["amount"], t["reference"], t["description"])
+            k = ledger.dedupe_key(t["date"], t["amount"], t["reference"], t["description"], t["acct"])
             if k in seen:
                 continue
             seen.add(k)
             matched.append(t)
         added = [t for t in matched if ledger.add_credit(d=t["date"], amount=t["amount"], description=t["description"],
-                                                        reference=t["reference"], statement_id=sid)]
+                                                        reference=t["reference"], statement_id=sid, account=t["acct"])]
         ledger.finish_statement(sid, len(matched), len(added))
 
-        credited = {L.parse_iso(r["entry_date"]) for r in ledger.credits_between(covered_from, covered_to)}
-        shown = {d for a, b in merged for d in (a + timedelta(days=i) for i in range((b - a).days + 1))}
-        workdays = ledger.working_days(covered_from, covered_to)
-        missing = [d for d in workdays if d in shown and d not in credited]
-        not_shown = [d for d in workdays if d not in shown and d not in credited]
-        others = [t for t in valid if t not in matched and str(t.get("direction")).lower() != "debit"]
-        months = sorted({(d.year, d.month) for d in dates} | {(covered_to.year, covered_to.month)})
+        sections = []
+        for acct in (a["number"] for a in accounts) if accounts else [""]:
+            runs = merged.get(acct)
+            if not runs:
+                continue
+            start, end = runs[0][0], runs[-1][1]
+            counts: dict[date, int] = {}
+            for r in ledger.credits_between(start, end, acct):
+                d = L.parse_iso(r["entry_date"])
+                counts[d] = counts.get(d, 0) + 1
+            shown = {d for a, b in runs for d in (a + timedelta(days=i) for i in range((b - a).days + 1))}
+            workdays = ledger.working_days(start, end)
+            unpaid, late = L.settle_days(start, end, counts, set(workdays), shown)
+            mine = [t for t in matched if t["acct"] == acct]
+            sections.append({
+                "account": acct, "name": next((a["name"] for a in accounts if a["number"] == acct), ""),
+                "from": start, "to": end, "rows": sum(1 for t in tracked if t["acct"] == acct),
+                "matched": mine, "added": [t for t in added if t["acct"] == acct],
+                "matched_counts": {d: sum(1 for t in mine if t["date"] == d) for d in {t["date"] for t in mine}},
+                "missing": unpaid, "late": late,
+                "not_shown": [d for d in workdays if d not in shown and d not in counts],
+                "others": [t for t in tracked if t["acct"] == acct and t not in mine
+                           and str(t.get("direction")).lower() != "debit"],
+            })
+        months = sorted({(t["date"].year, t["date"].month) for t in tracked} | {(covered_to.year, covered_to.month)})
         return {"statement_id": sid, "covered_from": covered_from, "covered_to": covered_to,
-                "transactions": len(valid), "matched": matched, "added": added, "missing": missing,
-                "not_shown": not_shown,
-                "others": others, "rejected": len(rejected), "months": months,
+                "transactions": len(valid), "matched": matched, "added": added, "sections": sections,
+                "other_accounts": sorted(other_accounts), "unattributed": len(unattributed),
+                "rejected": len(rejected), "months": months,
                 "notes": result.get("notes") or "", "account": result.get("account_label") or ""}
 
     def format_outcome(self, o: dict, file_count: int, sender: str) -> str:
@@ -606,32 +711,52 @@ class Relay:
                         "To ask Hermes about an image, send it with a caption.")
             note = f"\nNote: {o['notes']}" if o.get("notes") else ""
             return f"I read the statement ({files} from {sender}) but found no readable transaction rows.{note}"
-        matched, added = o["matched"], o["added"]
         lines = [f"**Statement read** ({files} from {sender})"]
-        if o.get("account"):
-            lines.append(f"Account: {o['account']}")
-        lines.append(f"Covers: {L.fmt_day(o['covered_from'])} – {L.fmt_day(o['covered_to'])} ({o['transactions']} rows)")
-        if matched:
-            total = sum(t["amount"] for t in matched)
-            lines.append(f"Matching credits: {len(matched)} ({L.inr(total)}) · new {len(added)}, already had {len(matched) - len(added)}")
-            lines.append(f"Credited on: {L.fmt_days(t['date'] for t in matched)}")
-        else:
-            lines.append("No matching credits found in this statement.")
-        if o["missing"]:
-            lines.append(f"⚠️ No credit on: {', '.join(L.fmt_day(d) for d in o['missing'][:10])}")
-        if o.get("not_shown"):
-            lines.append(f"⏳ Not in these screenshots: {L.fmt_days(o['not_shown'])} (send that page if you have it)")
-        if matched and not o["missing"] and not o.get("not_shown"):
-            lines.append("✅ Every working day in this range has its credit.")
-        if o["others"]:
-            shown = "; ".join(f"{t['date'].day} {t['date'].strftime('%b')} {L.inr(t['amount'])} {t['description'][:30]}"
-                              for t in o["others"][:4])
-            lines.append(f"Other credits seen (not counted): {shown}")
+        if not o["sections"]:
+            lines.append("None of it is for a tracked account, so nothing was recorded.")
+        for sec in o["sections"]:
+            if sec["account"]:
+                lines.append("")
+                lines.append(f"**{sec['name']}** (A/C {sec['account']}) · {L.fmt_day(sec['from'])} – {L.fmt_day(sec['to'])}")
+            else:
+                if o.get("account"):
+                    lines.append(f"Account: {o['account']}")
+                lines.append(f"Covers: {L.fmt_day(sec['from'])} – {L.fmt_day(sec['to'])} ({sec['rows']} rows)")
+            matched, added = sec["matched"], sec["added"]
+            if matched:
+                total = sum(t["amount"] for t in matched)
+                lines.append(f"Matching credits: {len(matched)} ({L.inr(total)}) · new {len(added)}, already had {len(matched) - len(added)}")
+                lines.append(f"Credited on: {L.fmt_day_counts(sec['matched_counts'])}")
+            else:
+                lines.append("No matching credits found.")
+            if sec["late"]:
+                lines.append("⏰ Paid late: " + ", ".join(f"{L.fmt_short(a)} (on {L.fmt_short(b)})" for a, b in sec["late"]))
+            if sec["missing"]:
+                lines.append(f"⚠️ No credit on: {', '.join(L.fmt_day(d) for d in sec['missing'][:10])}")
+            if sec["not_shown"]:
+                lines.append(f"⏳ Not in these screenshots: {L.fmt_days(sec['not_shown'])} (send that page if you have it)")
+            if matched and not sec["missing"] and not sec["not_shown"]:
+                lines.append("✅ Every working day in this range has its credit.")
+            if sec["others"]:
+                shown = "; ".join(f"{L.fmt_short(t['date'])} {L.inr(t['amount'])}" + (f" {t['description'][:20]}" if t["description"] else "")
+                                  for t in sec["others"][:4])
+                lines.append(f"Other credits seen (not counted): {shown}")
+        if o["sections"] and o["sections"][0]["account"]:
+            lines.append("")
+        if o.get("other_accounts"):
+            lines.append(f"Ignored rows for other accounts: A/C {', '.join(o['other_accounts'])}")
+        if o.get("unattributed"):
+            lines.append(f"Skipped {o['unattributed']} row(s): couldn't tell which account they belong to.")
         if o.get("rejected"):
             lines.append(f"Skipped {o['rejected']} row(s) with unreadable dates or amounts.")
         for y, m in o["months"][-2:]:
-            s = self.ledger.month_summary(y, m)
-            lines.append(f"{s['label']} so far: **{L.inr(s['total'])}** from {s['count']} credits")
+            summaries = self.ledger.month_summaries(y, m)
+            if len(summaries) == 1:
+                s = summaries[0]
+                lines.append(f"{s['label']} so far: **{L.inr(s['total'])}** from {s['count']} credits")
+            else:
+                parts = " · ".join(f"{s['name']} {L.inr(s['total'])}" for s in summaries)
+                lines.append(f"{summaries[0]['label']} so far: {parts} · together **{L.inr(sum(s['total'] for s in summaries))}**")
         if o.get("notes"):
             lines.append(f"Note: {o['notes'][:200]}")
         return "\n".join(lines)
@@ -645,8 +770,8 @@ class Relay:
             key = f"final_sent:{y:04d}-{m:02d}"
             if self.ledger.get_meta(key):
                 continue
-            s = self.ledger.month_summary(y, m, today=today)
-            if s["last_day_in"] and s["last_expected"] <= today:
+            summaries = self.ledger.month_summaries(y, m, today=today)
+            if all(s["last_day_in"] and s["last_expected"] <= today for s in summaries):
                 out.append(self.ledger.month_report(y, m, final=True, today=today))
                 self.ledger.set_meta(key, L.now_local(self.cfg).isoformat())
         return out
@@ -753,6 +878,10 @@ class Relay:
         if cmd == "reload":
             self.reload()
             return "Config reloaded.\n\n" + self.status_text(today)
+        if cmd == "settings":
+            return self.settings_text()
+        if cmd in ("set", "add", "remove"):
+            return self.set_setting(cmd, args)
         if cmd == "groups":
             return await self.groups_text()
         if cmd == "removegroup":
@@ -782,10 +911,98 @@ class Relay:
             return f"Type !{cmd} inside the group itself (after `bash setup.sh groups on`)."
         return f"Unknown command !{cmd}. Send !help for the list."
 
+    # ------------------------------------------------------------------ settings from WhatsApp
+    def settings_text(self) -> str:
+        fwd, stm = self.cfg["forwarding"], self.cfg["statement"]
+        nums = lambda values: ", ".join(n for n in (phone(v) for v in values or []) if n) or "none"  # noqa: E731
+        accounts = L.tracked_accounts(self.cfg)
+        amount = L.inr(float(stm["expected_amount"])) if stm.get("expected_amount") else "any amount"
+        kinds = ", ".join(map(str, fwd.get("forward_kinds") or [])) or "all files"
+        return "\n".join([
+            "**Settings**",
+            f"Your number: {self.owner}",
+            f"Source numbers: {nums(fwd.get('source_numbers'))}",
+            f"Forwarded: {kinds}",
+            f"Firm's number: {nums(stm.get('sender_numbers'))}",
+            f"Accounts: {', '.join(a['name'] + ' (' + a['number'] + ')' for a in accounts) or 'one combined tracker'}",
+            f"Keyword: {', '.join(map(str, stm.get('match_keywords') or [])) or 'none'}",
+            f"Amount: {amount}",
+            "",
+            SET_USAGE,
+            "Your own number and the Gemini key are changed on the server with `bash setup.sh`.",
+        ])
+
+    def _parse_items(self, name: str, text: str) -> tuple[list, Optional[str]]:
+        """(values, error) for a comma-separated list typed after !set/!add/!remove."""
+        items = [p.strip() for p in text.split(",") if p.strip()]
+        if name in ("source", "firm"):
+            out = []
+            for part in items:
+                number = phone(part)
+                if not 11 <= len(number) <= 15:
+                    return [], f"“{part}” doesn't look like a phone number. Use the country code, like 919847012345."
+                if number == self.owner:
+                    return [], "That's your own number. Use the other person's number."
+                if number not in out:
+                    out.append(number)
+            return out, None
+        if name == "account":
+            out = []
+            for part in items:
+                number, _, label = part.partition(" ")
+                key = L.account_key(number)
+                if len(key) < 2:
+                    return [], f"“{part}” should start with the account number, like: 1001 Asha"
+                out.append({"number": key, "name": label.strip() or f"A/C {key}"})
+            return out, None
+        return items, None  # keyword
+
+    def set_setting(self, op: str, args: list[str]) -> str:
+        name = SETTING_ALIASES.get(args[0].lower(), args[0].lower()) if args else ""
+        if name not in SETTINGS:
+            return SET_USAGE
+        section, key = SETTINGS[name]
+        text = " ".join(args[1:]).strip()
+        if name == "amount":
+            if op != "set":
+                return "Use !set amount 2000"
+            try:
+                value = float(text.replace(",", "").replace("₹", "").strip())
+            except ValueError:
+                value = 0
+            if value <= 0:
+                return "Use a number, like !set amount 2000"
+            value = int(value) if value == int(value) else value
+        else:
+            if op == "set" and text.lower() in CLEAR_WORDS:
+                items, error = [], None
+            elif not text:
+                return f"Use !{op} {name} <value>. Send !settings to see the current ones."
+            else:
+                items, error = self._parse_items(name, text)
+            if error:
+                return error
+            current = list(self.cfg[section].get(key) or [])
+            same = (lambda a, b: L.account_key(a.get("number") if isinstance(a, dict) else a) == b["number"]) \
+                if name == "account" else (lambda a, b: phone(a) == b if name in ("source", "firm") else str(a).lower() == str(b).lower())
+            if op == "set":
+                value = items
+            elif op == "add":
+                value = [c for c in current if not any(same(c, i) for i in items)] + items
+            else:
+                value = [c for c in current if not any(same(c, i) for i in items)]
+                if len(value) == len(current):
+                    return f"Nothing removed: that {name} isn't in the list. Send !settings to see it."
+        user = L.read_user_config(self.home)
+        user.setdefault(section, {})[key] = value
+        L.save_user_config(user, self.home)
+        self.reload()
+        logger.info("[relay] setting changed from WhatsApp: %s %s = %s", op, name, value)
+        return "✅ Saved.\n\n" + self.settings_text().split("\n\n", 1)[0]
+
     def status_text(self, today: date) -> str:
         fwd, stm = self.cfg["forwarding"], self.cfg["statement"]
         last = self.ledger.last_statement_at()
-        s = self.ledger.month_summary(today.year, today.month, today=today)
         groups = self.target_groups()
         if groups:
             names = ", ".join(g.get("name") or f"group {i}" for i, g in enumerate(groups, 1))
@@ -795,12 +1012,17 @@ class Relay:
         sources = [n for n in (phone(x) for x in fwd.get("source_numbers") or []) if n]
         firms = [n for n in (phone(x) for x in stm.get("sender_numbers") or []) if n]
         lines = ["**Relay status**",
-                 f"Forwarding: {'on' if fwd.get('enabled') else 'off'} · from {', '.join(sources) or '(no source number set)'} → {to}",
+                 f"Forwarding: {'on' if fwd.get('enabled') else 'off'} · from {', '.join(sources) or '(no source number yet: !set source <number>)'} → {to}",
                  f"Statements: {'on' if stm.get('enabled') else 'off'} · read from you" + (f" and {FIRM} ({', '.join(firms)})" if firms else "")
                  + f" · tracking {L.inr(float(stm['expected_amount'])) if stm.get('expected_amount') else 'any amount'} credits"
                  + (f" mentioning {', '.join(map(str, stm['match_keywords']))}" if stm.get("match_keywords") else ""),
-                 f"Last statement: {last.strftime('%d %b %Y, %I:%M %p') if last else 'none yet'}",
-                 f"{s['label']}: **{L.inr(s['total'])}** from {s['count']} credit{'s' if s['count'] != 1 else ''}"]
+                 f"Last statement: {last.strftime('%d %b %Y, %I:%M %p') if last else 'none yet'}"]
+        for s in self.ledger.month_summaries(today.year, today.month, today=today):
+            who = f"{s['name']}, " if s["account"] else ""
+            lines.append(f"{s['label']} ({who}so far): **{L.inr(s['total'])}** from {s['count']} credit{'s' if s['count'] != 1 else ''}")
+        missing_groups = self.missing_group_names()
+        if missing_groups:
+            lines.append(f"Groups not found yet: {', '.join(missing_groups)} (run `bash setup.sh groups` on the server)")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ agent tool
@@ -811,19 +1033,40 @@ class Relay:
             mt = re.fullmatch(r"(\d{4})-(\d{1,2})", str(month).strip())
             if mt:
                 y, m = int(mt.group(1)), int(mt.group(2))
-        s = self.ledger.month_summary(y, m, today=today)
         last = self.ledger.last_statement_at()
+        accounts = []
+        for s in self.ledger.month_summaries(y, m, today=today):
+            accounts.append({
+                "account": s["account"] or "all", "name": s["name"] or "all accounts",
+                "total_rupees": s["total"], "credits": s["count"],
+                "credited_days": [d.isoformat() for d in s["credited_days"]],
+                "working_days_in_month": len(s["expected_days"]),
+                "working_days_so_far": len(s["expected_so_far"]),
+                "missing_days": [d.isoformat() for d in s["missing"]],
+                "paid_late": [{"day": a.isoformat(), "paid_on": b.isoformat()} for a, b in s["late"]],
+                "not_yet_in_any_statement": [d.isoformat() for d in s["pending"]],
+                "month_complete": s["complete"],
+            })
         return {
-            "month": s["label"], "total_rupees": s["total"], "credits": s["count"],
-            "credited_days": [d.isoformat() for d in s["credited_days"]],
-            "working_days_in_month": len(s["expected_days"]),
-            "working_days_so_far": len(s["expected_so_far"]),
-            "missing_days": [d.isoformat() for d in s["missing"]],
-            "not_yet_in_any_statement": [d.isoformat() for d in s["pending"]],
-            "month_complete": s["complete"],
+            "month": L.month_name(y, m), "accounts": accounts,
+            "total_rupees_all_accounts": round(sum(a["total_rupees"] for a in accounts), 2),
             "last_statement_received": last.isoformat() if last else None,
             "report_text": self.ledger.month_report(y, m, today=today),
         }
+def file_category(kind: str, media: list[tuple[str, Optional[str]]]) -> str:
+    """image / video / audio / document / sticker. A picture sent "as a document" (to keep its quality) is an image."""
+    kind = (kind or "").lower()
+    mimes = [(m or "").lower() for _, m in media]
+    exts = [Path(p).suffix.lower() for p, _ in media]
+    if kind == "sticker":
+        return "sticker"
+    if kind == "image" or (kind in ("", "document") and (any(m.startswith("image/") for m in mimes) or any(e in IMAGE_EXTS for e in exts))):
+        return "image"
+    if kind in ("video", "gif"):
+        return "video"
+    if kind in ("audio", "ptt"):
+        return "audio"
+    return "document"
 
 
 def _clean_name(path: str) -> str:

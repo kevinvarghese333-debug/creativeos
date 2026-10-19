@@ -20,11 +20,22 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "tests"))
+from statement_rows import ACCOUNT_A, ACCOUNT_B, ACCOUNTS, rows  # noqa: E402
+
 C = "hermes-whatsapp"
-OWNER, SOURCE, FIRM, STRANGER = "919847012345", "919847099999", "919400011111", "919811122233"
+OWNER, SOURCE, SOURCE2, FIRM, STRANGER = "919847012345", "919847099999", "919072900002", "919400011111", "919811122233"
 G1, G2, G3, G4 = ("120363000000000001@g.us", "120363000000000002@g.us",
                   "120363000000000003@g.us", "120363000000000004@g.us")
-NAMES = {G1: "Office A", G2: "Office B", G3: "Office C", G4: "Family"}
+NAMES = {G1: "AREA MANAGERS ♻️⚧️", G2: "Asst Area Managers", G3: "🎯MANAGERS🎯", G4: "Family"}
+SETTINGS = {  # like a personal zip's settings.json, with test numbers
+    "owner_number": OWNER,
+    "forwarding": {"source_numbers": [SOURCE, SOURCE2], "forward_kinds": ["image"],
+                   "target_group_names": ["AREA MANAGERS", "Asst Area Managers", "MANAGERS"]},
+    "statement": {"sender_numbers": [FIRM], "match_keywords": [],
+                  "accounts": ACCOUNTS},
+    "calendar": {"weekly_off": ["sunday"], "holidays": ["2026-10-02"]},
+}
 jid = lambda n: f"{n}@s.whatsapp.net"  # noqa: E731
 
 failures: list[str] = []
@@ -117,13 +128,17 @@ def main() -> int:
     data = pkg / "data"
     setup = lambda *a, inp=None: sh(["bash", "setup.sh", *a], inp=inp, cwd=pkg, check=False)  # noqa: E731
 
-    # ---------------------------------------------------------------- setup.sh, first run
-    out = setup(inp=f"{OWNER[2:]}\n+91 {SOURCE[2:7]} {SOURCE[7:]}\n{FIRM}\n4417\nAIzaFAKEKEY00000000000000000000000000\n")
-    check("setup: saves config and finishes", "Saved " in out and "Done." in out and "Next: bash setup.sh pair" in out, out)
+    # ---------------------------------------------------------------- setup.sh with a personal settings.json
+    (pkg / "settings.json").write_text("// test numbers\n" + json.dumps(SETTINGS, indent=2))
+    out = setup(inp="AIzaFAKEKEY00000000000000000000000000\n")
+    check("setup: uses settings.json and only asks for the key",
+          "Applied settings.json" in out and "Asha (1001), Ravi (1002)" in out and "1. Your own" not in out
+          and "Done." in out and "Next: bash setup.sh pair" in out, out)
     cfg = json.loads((data / "whatsapp-relay/config.json").read_text())
-    check("setup: answers normalised into config.json",
-          cfg["owner_number"] == OWNER and cfg["forwarding"]["source_numbers"] == [SOURCE]
-          and cfg["statement"]["sender_numbers"] == [FIRM] and cfg["statement"]["match_keywords"] == ["4417"], json.dumps(cfg)[:400])
+    check("setup: settings.json copied into config.json",
+          cfg["owner_number"] == OWNER and cfg["forwarding"]["source_numbers"] == [SOURCE, SOURCE2]
+          and cfg["forwarding"]["forward_kinds"] == ["image"] and cfg["statement"]["sender_numbers"] == [FIRM]
+          and len(cfg["statement"]["accounts"]) == 2, json.dumps(cfg)[:400])
     env = (data / ".env").read_text()
     check("setup: Hermes .env has bot mode, owner, home chat, Gemini key",
           "WHATSAPP_MODE=bot" in env and f"WHATSAPP_ALLOWED_USERS={OWNER}" in env and "GOOGLE_API_KEY=AIzaFAKE" in env
@@ -136,9 +151,15 @@ def main() -> int:
                  str(data / "scripts/relay_nudge.py")]).split()
     check("setup: files owned by the container user", set(owners) == {"10000"}, str(owners))
 
-    out = setup(inp="\n\n\n\n\n")
+    out = setup(inp="\n")
     cfg2 = json.loads((data / "whatsapp-relay/config.json").read_text())
-    check("setup: re-run with Enter keeps every answer", cfg2 == cfg and "Done." in out, out)
+    check("setup: re-run keeps everything and doesn't re-apply settings.json",
+          cfg2 == cfg and "Applied" not in out and "Done." in out, out)
+    out = setup("questions", inp="\n\n\n\n\n")
+    cfg3 = json.loads((data / "whatsapp-relay/config.json").read_text())
+    changed = {k: (cfg.get(k), cfg3.get(k)) for k in set(cfg) | set(cfg3) if cfg.get(k) != cfg3.get(k)}
+    check("setup questions: Enter keeps all answers, including both source numbers",
+          not changed and "Saved" in out, f"{changed}\n{out}")
 
     # ---------------------------------------------------------------- fake bridge in place of Baileys
     fb = data / "fakebridge"
@@ -171,77 +192,104 @@ def main() -> int:
     # ---------------------------------------------------------------- owner commands
     new = say(OWNER, "!status")
     t = texts_to(new, jid(OWNER))
-    check("!status answers the owner", len(t) == 1 and "Relay status" in t[0] and "no groups yet" in t[0], str(new))
+    check("!status answers the owner", len(t) == 1 and "Relay status" in t[0] and "no groups yet" in t[0]
+          and "Groups not found yet" in t[0], str(new))
     new = say(OWNER, "!help")
-    check("!help lists group commands", any("!addgroup" in x for x in texts_to(new, jid(OWNER))), str(new))
+    check("!help lists group and settings commands",
+          any("!addgroup" in x and "!settings" in x for x in texts_to(new, jid(OWNER))), str(new))
+    new = say(OWNER, "!settings")
+    check("!settings shows the numbers and accounts", any(SOURCE2 in x and "Asha (1001)" in x and "Forwarded: image" in x
+                                                         for x in texts_to(new, jid(OWNER))), str(new))
 
-    # ---------------------------------------------------------------- groups
+    # ---------------------------------------------------------------- groups found by name
     new = say(OWNER, "!addgroup", chat=G1, expect=0)
-    check("groups off: !addgroup in a group is not seen", new == [], str(new))
-
-    out = setup("groups", "on")
-    check("groups on: restarts and explains", "Groups on." in out, out)
+    check("groups closed: group messages are not seen", new == [], str(new))
+    proc = subprocess.Popen(["bash", "setup.sh", "groups"], cwd=pkg, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    lines = []
+    for line in proc.stdout:
+        lines.append(line)
+        if "Looking for these groups" in line:
+            break
     wait_bridge(); set_chats(); time.sleep(3)
-    for gid in (G1, G2, G3):
-        new = say(OWNER, "!addgroup", chat=gid)
-        t = texts_to(new, jid(OWNER))
-        check(f"!addgroup in {NAMES[gid]} confirms privately", len(t) == 1 and t[0].startswith(f"✅ Added {NAMES[gid]}")
-              and not texts_to(new, gid), str(new))
-    new = say(OWNER, "!addgroup", chat=G1)
-    check("!addgroup twice says already added", any("already a forwarding group" in x for x in texts_to(new, jid(OWNER))), str(new))
-    new = say(STRANGER, "!addgroup", chat=G4, expect=0)
-    check("a stranger's !addgroup is ignored", new == [], str(new))
-    new = say(OWNER, "hello everyone", chat=G4, expect=0)
-    check("ordinary group chat gets no reply", new == [], str(new))
-    log = dx("tail", "-n", "300", "/opt/data/logs/agent.log")
-    check("group chat IDs are logged for troubleshooting", f"chat={G4}" in log)
+    n = len(sent())
+    inject(STRANGER, "Thiruvankulam", chat=G1)
+    inject(STRANGER, "Ashtamichira", chat=G2)
+    inject(STRANGER, "hello", chat=G4)
+    inject(OWNER, "good morning", chat=G3)
+    try:
+        rest, _ = proc.communicate(timeout=240)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        rest = proc.communicate()[0]
+    out = "".join(lines) + rest
+    wait_bridge(); set_chats(); time.sleep(3)  # setup restarted the container when it stopped looking
+    check("setup groups: finds all three by name, then closes group messages",
+          out.count("✅ Found:") == 3 and "Stopped looking" in out and G3 in out and "Not found yet" not in out
+          and proc.returncode == 0, out)
+    found = texts_to(sent()[n:], jid(OWNER))
+    check("the owner is told as each group is found", len(found) == 3 and found[-1].endswith("All groups found."), str(found))
+    check("the bot never writes in a group", not any(texts_to(sent()[n:], g) for g in (G1, G2, G3, G4)))
     groups = json.loads((data / "whatsapp-relay/groups.json").read_text())["groups"]
-    check("groups.json has the three groups with names", [(g["id"], g["name"]) for g in groups] == [(g, NAMES[g]) for g in (G1, G2, G3)], str(groups))
-
-    out = setup("groups", "off")
-    check("groups off: lists the groups", "Groups off." in out and G1 in out and "Office C" in out, out)
-    wait_bridge(); set_chats(); time.sleep(3)
+    check("groups.json has the three groups (not Family)", sorted(g["id"] for g in groups) == [G1, G2, G3], str(groups))
+    log = dx("tail", "-n", "400", "/opt/data/logs/agent.log")
+    check("group chat IDs are logged for troubleshooting", f"chat={G4}" in log)
+    new = say(OWNER, "!addgroup", chat=G4, expect=0)
+    check("groups closed again afterwards", new == [], str(new))
     new = say(OWNER, "!testgroups", expect=4)
     check("!testgroups reaches all three groups", all(texts_to(new, g) for g in (G1, G2, G3))
-          and "✅ Office A" in "".join(texts_to(new, jid(OWNER))), str(new))
+          and "✅ AREA MANAGERS" in "".join(texts_to(new, jid(OWNER))), str(new))
 
-    # ---------------------------------------------------------------- forwarding
-    new = say(SOURCE, "Invoice 12", media={"kind": "image", "src": "/opt/data/fakebridge/assets/photo.jpg", "mime": "image/jpeg"}, expect=3)
+    # ---------------------------------------------------------------- forwarding: pictures only
+    new = say(SOURCE, "Gold Outstanding as on 17-10-2026",
+              media={"kind": "image", "src": "/opt/data/fakebridge/assets/photo.jpg", "mime": "image/jpeg"}, expect=3)
     media = [s for s in new if s["kind"] == "media"]
-    check("photo from the source goes to all three groups with its caption",
-          sorted(m["chatId"] for m in media) == sorted([G1, G2, G3]) and all(m["caption"] == "Invoice 12" and m["mediaType"] == "image" for m in media)
+    check("a report picture goes to all three groups with its caption",
+          sorted(m["chatId"] for m in media) == sorted([G1, G2, G3])
+          and all(m["caption"] == "Gold Outstanding as on 17-10-2026" and m["mediaType"] == "image" for m in media)
           and not [s for s in new if s["chatId"] == jid(SOURCE)], str(new))
+    new = say(SOURCE2, "", media={"kind": "document", "src": "/opt/data/fakebridge/assets/statement.png", "mime": "image/png",
+                                  "fileName": "MIS.png"}, expect=3)
+    check("a picture sent as a document from another source number is forwarded too",
+          len([s for s in new if s["kind"] == "media"]) == 3, str(new))
+    n = len(sent())
+    for i in range(5):
+        inject(SOURCE, f"Zone MIS {i}", media={"kind": "image", "src": "/opt/data/fakebridge/assets/photo.jpg", "mime": "image/jpeg"})
+    new = wait_new(n, 15, 90)
+    check("five screenshots sent at once all reach all three groups",
+          sorted(m["caption"] for m in new if m["kind"] == "media") == sorted(f"Zone MIS {i}" for i in range(5) for _ in range(3)), str(new))
     new = say(SOURCE, "", media={"kind": "document", "src": "/opt/data/fakebridge/assets/letter.pdf", "mime": "application/pdf",
-                                 "fileName": "Oct Letter.pdf"}, expect=3)
-    media = [s for s in new if s["kind"] == "media"]
-    check("PDF from the source keeps its file name, no caption added",
-          len(media) == 3 and all(m["fileName"] == "Oct Letter.pdf" and m["mediaType"] == "document" and m["caption"] == "" for m in media), str(new))
-    new = say(SOURCE, "are you there?", expect=0)
-    check("text from the source is ignored", new == [], str(new))
+                                 "fileName": "Oct Letter.pdf"}, expect=0)
+    check("a PDF is not forwarded (pictures only)", new == [], str(new))
+    new = say(SOURCE, "Ok Sir", expect=0)
+    check("text from a source number is not forwarded", new == [], str(new))
     new = say(STRANGER, "hi", expect=0)
     check("a stranger gets no reply at all", new == [], str(new))
     fwd_log = (data / "whatsapp-relay/forward-log.jsonl").read_text().strip().splitlines()
-    check("forward-log.jsonl records each forward", len(fwd_log) == 2 and all(json.loads(x)["sends"] for x in fwd_log), str(fwd_log))
+    check("forward-log.jsonl records each forward", len(fwd_log) == 7 and all(json.loads(x)["sends"] for x in fwd_log), str(fwd_log))
 
-    # ---------------------------------------------------------------- statements through fake Gemini
-    rows = [{"date": f"2026-10-{d:02d}", "description": "NEFT CR SB XXXX4417 DAILY", "amount": 2000, "direction": "credit",
-             "reference": f"N2860{d:02d}", "image": 1} for d in (12, 13, 15, 16, 17)]
-    rows += [{"date": "2026-10-14", "description": "ATM WDL", "amount": 500, "direction": "debit", "reference": "", "image": 1},
-             {"date": "2026-10-16", "description": "SALARY OCT", "amount": 15000, "direction": "credit", "reference": "S1", "image": 1}]
-    response = {"is_statement": True, "account_label": "SB XXXX4417", "transactions": rows, "notes": ""}
+    # ---------------------------------------------------------------- statements: two accounts through fake Gemini
+    response = {"is_statement": True, "account_label": "", "notes": "",
+                "transactions": rows(ACCOUNT_A, "1001", 1) + rows(ACCOUNT_B, "1002", 2)}
     (fb / "gemini-response.json").write_text(json.dumps(response))
-    new = say(FIRM, "", media={"kind": "image", "src": "/opt/data/fakebridge/assets/statement.png", "mime": "image/png"}, timeout=60)
+    n = len(sent())
+    inject(FIRM, "", media={"kind": "image", "src": "/opt/data/fakebridge/assets/statement.png", "mime": "image/png"})
+    inject(FIRM, "", media={"kind": "image", "src": "/opt/data/fakebridge/assets/photo.jpg", "mime": "image/jpeg"})
+    new = wait_new(n, 1, 60)
     t = texts_to(new, jid(OWNER))
-    check("firm's statement is read and confirmed to the owner",
-          len(t) == 1 and "Statement read" in t[0] and "from the firm" in t[0] and "Matching credits: 5 (₹10,000)" in t[0]
-          and "No credit on: Wed 14 Oct" in t[0] and "SALARY" in t[0] and not texts_to(new, jid(FIRM)), str(new))
-    archived = list((data / "whatsapp-relay/statements").rglob("*.png"))
-    check("statement image is archived", len(archived) == 1, str(archived))
+    check("the firm's two ledger photos are read together, each account on its own",
+          len(t) == 1 and "(2 files from the firm)" in t[0] and "*Asha* (A/C 1001)" in t[0] and "*Ravi* (A/C 1002)" in t[0]
+          and "Paid late: 8 Oct (on 9 Oct)" in t[0] and "No credit on: Thu 1 Oct" in t[0]
+          and "together *₹52,000*" in t[0] and not texts_to(new, jid(FIRM)), str(new))
+    archived = list((data / "whatsapp-relay/statements").rglob("*.*"))
+    check("both statement photos are archived", len(archived) == 2, str(archived))
+    calls = (fb / "gemini-calls.log").read_text().strip().splitlines()
+    check("one Gemini call for the two photos", len(calls) == 1, str(calls))
 
     new = say(OWNER, "!report")
-    check("!report shows the missing day", any("Deposit report: October 2026" in x and "14 Oct" in x for x in texts_to(new, jid(OWNER))), str(new))
-    new = say(OWNER, "!holiday 14/10/2026")
-    check("!holiday accepts day-first dates", any("Marked as holiday: Wed 14 Oct" in x for x in texts_to(new, jid(OWNER))), str(new))
+    check("!report shows each account and the total", any("*Asha* (A/C 1001)" in x and "Together: *₹52,000*" in x
+                                                          for x in texts_to(new, jid(OWNER))), str(new))
+    new = say(OWNER, "!holiday 01/10/2026")
+    check("!holiday accepts day-first dates", any("Marked as holiday: Thu 1 Oct" in x for x in texts_to(new, jid(OWNER))), str(new))
     new = say(OWNER, "!report")
     check("a holiday drops off the report", any("No credit on" not in x for x in texts_to(new, jid(OWNER))), str(new))
 
@@ -252,7 +300,7 @@ def main() -> int:
     new = say(OWNER, "!retry", expect=2, timeout=60)
     t = texts_to(new, jid(OWNER))
     check("!retry reads it again; duplicates are not counted twice",
-          any("Reading the 1 file(s) again" in x for x in t) and any("new 0, already had 5" in x for x in t), str(new))
+          any("Reading the 1 file(s) again" in x for x in t) and any(x.count("new 0, already had 13") == 2 for x in t), str(new))
     new = say(OWNER, "!undo")
     check("!undo removes the last statement", any("Removed the last statement" in x for x in texts_to(new, jid(OWNER))), str(new))
 
@@ -260,7 +308,13 @@ def main() -> int:
     t = texts_to(new, jid(OWNER))
     check("two commands in one message get two answers", len(t) == 2 and "Holidays:" in t[0] and "Forwarding groups" in t[1], str(new))
     new = say(OWNER, "!removegroup 3")
-    check("!removegroup <n> removes that group", any("Removed Office C" in x for x in texts_to(new, jid(OWNER))), str(new))
+    check("!removegroup <n> removes that group", any(x.startswith("Removed ") and "2 groups" in x for x in texts_to(new, jid(OWNER))), str(new))
+    new = say(OWNER, "!add source 9811122233")
+    check("!add source saves a new number", any(x.startswith("✅ Saved.") and STRANGER in x for x in texts_to(new, jid(OWNER)))
+          and STRANGER in json.loads((data / "whatsapp-relay/config.json").read_text())["forwarding"]["source_numbers"], str(new))
+    new = say(STRANGER, "MIS", media={"kind": "image", "src": "/opt/data/fakebridge/assets/photo.jpg", "mime": "image/jpeg"}, expect=2)
+    check("pictures from the newly added number are forwarded", len([s for s in new if s["kind"] == "media"]) == 2, str(new))
+    say(OWNER, f"!remove source {STRANGER}")
 
     skips = lambda: dx("grep", "-c", "pre_gateway_dispatch skip", "/opt/data/logs/agent.log").strip()  # noqa: E731
     before = skips()

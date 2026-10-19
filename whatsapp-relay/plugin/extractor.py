@@ -35,6 +35,7 @@ RESPONSE_SCHEMA = {
                     "amount": {"type": "NUMBER"},
                     "direction": {"type": "STRING", "enum": ["credit", "debit", "unknown"]},
                     "reference": {"type": "STRING"},
+                    "account": {"type": "STRING"},
                     "image": {"type": "INTEGER"},
                 },
                 "required": ["date", "description", "amount", "direction"],
@@ -57,7 +58,10 @@ Rules:
   "unknown" only if you truly cannot tell.
 - description: the narration / particulars text for that row, copied as printed.
 - reference: any cheque number, UTR, reference or transaction ID on that row, else "".
+- account: the account number printed in the header of the statement that row is on, digits only
+  ("SB A/C-1,001.00" or "A/c No 1,001.00" -> "1001"). Different files can be different accounts.
 - image: which attached file the row appears on (1 = the first file, 2 = the second, ...).
+- The files may be photos of a computer screen: read the Deposit/Credit and Withdraw/Debit columns carefully.
 - If the same row appears in two overlapping screenshots, list it ONCE.
 - period_start / period_end: the statement period if printed, else "".
 - account_label: account number (masked is fine) or account name shown, else "".

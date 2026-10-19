@@ -50,8 +50,7 @@ def main() -> int:
         if ledger.get_meta(f"month_end_sent:{tag}") or ledger.get_meta(f"final_sent:{tag}"):
             continue
         report = ledger.month_report(y, m, today=today)
-        s = ledger.month_summary(y, m, today=today)
-        if not s["last_day_in"]:
+        if not ledger.last_day_in(y, m, today=today):
             report += "\nThe final total follows automatically once the last week's statement is in."
         ledger.set_meta(f"month_end_sent:{tag}", now.isoformat())
         out.append(report)

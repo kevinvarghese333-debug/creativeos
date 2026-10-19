@@ -2,8 +2,8 @@
 
 A dedicated WhatsApp number, linked to its own Hermes in a Docker container (`hermes-whatsapp`) on the VPS. A small plugin inside Hermes does three jobs:
 
-1. **Forwards files.** Anything the source number sends to the bot (photo, PDF, document, video, voice note) goes to your three groups with its original caption. Plain rules, no AI, no cost.
-2. **Tracks the ₹2,000 credits.** Statement screenshots or PDFs are read with one Gemini call. Every ₹2,000 credit goes into a local ledger, and you get a WhatsApp confirmation listing the days credited and any working day without a credit.
+1. **Forwards files.** What the source numbers send to the bot goes to your three groups with its original caption: only pictures, or also PDFs, videos and voice notes, as you choose. Plain rules, no AI, no cost.
+2. **Tracks the ₹2,000 credits.** Statement screenshots, photos or PDFs are read with one Gemini call. Every ₹2,000 credit goes into a local ledger, kept separately for each account, and you get a WhatsApp confirmation listing the days credited, any day paid late, and any working day without a credit.
 3. **Keeps you on schedule.** A nudge if 7 days pass with no statement, a month total on the last evening of the month, and a final total once the statement covering the month's last working day arrives.
 
 You can also ask the bot normal questions ("how much came in this month?") and Hermes answers from the same ledger, using the free Gemini key.
@@ -12,8 +12,9 @@ You can also ask the bot normal questions ("how much came in this month?") and H
 
 | Message | What happens |
 |---|---|
-| A file from the source number | Forwarded to the groups. The bot never replies to that person. |
-| Text from the source number | Ignored. |
+| A picture from a source number | Forwarded to the groups. The bot never replies to that person. |
+| Any other file from a source number | Forwarded only if `forward_kinds` includes it (see Settings). |
+| Text from a source number | Ignored. |
 | A screenshot or PDF from the firm | Read as a statement; you get the confirmation. The bot never replies to the firm. |
 | A screenshot or PDF from you, no caption | Read as a statement. |
 | A photo from you with a caption | Goes to Hermes as a normal question. |
@@ -50,22 +51,26 @@ unzip -o whatsapp-relay.zip && cd whatsapp-relay
 
 No Hermes password is needed: this container is a fresh Hermes with no login.
 
-## Step 2: Answer the setup questions
+## Step 2: Run setup
 
 ```bash
 bash setup.sh
 ```
 
-It asks:
+**If your zip came with a `settings.json`** (your numbers, groups and accounts already filled in), setup shows those settings and asks only for your **Gemini key**.
+
+Otherwise it asks:
 
 1. Your own number
-2. The source number
+2. The source number (Enter to skip; more can be added from WhatsApp)
 3. The firm's number (Enter to skip if you'll forward statements yourself)
 4. A word that appears in the ₹2,000 entry, such as the account's last 4 digits (Enter to skip and count every ₹2,000 credit)
 5. Your Gemini key
 
 Numbers with country code (`919847012345`); a plain 10-digit mobile also works. The first run downloads Hermes (a minute or two).
 **Expected:** `Saved ...config.json`, `Done.`, then `Next: bash setup.sh pair`.
+
+Everything except your own number and the Gemini key can be changed later from WhatsApp: send `!settings` to the bot.
 
 ## Step 3: Link the bot's WhatsApp
 
@@ -87,18 +92,15 @@ bash setup.sh pair
 From your own phone, send `!status` to the bot number.
 **Expected:** a status reply within a few seconds.
 
-## Step 5: Add the three groups
+## Step 5: Find the three groups
 
 ```bash
-bash setup.sh groups on
+bash setup.sh groups
 ```
 
-Wait about 20 seconds. From your own phone, type `!addgroup` inside each of the three groups.
-**Expected:** after each one, the bot messages you privately: *✅ Added (group name)*. The bot never writes anything in the group itself.
+When the group names are in your settings (`target_group_names`), the bot finds each group by itself the next time anyone posts in it, and messages you privately: *✅ Found AREA MANAGERS (1 of 3)*. Leave the command running; once all are found it stops looking at group messages and lists them. Busy groups are found within minutes. For a quiet group, type `!addgroup` inside it from your own phone. The bot never writes anything in a group except the forwarded files.
 
-```bash
-bash setup.sh groups off
-```
+Without group names: run `bash setup.sh groups on`, type `!addgroup` inside each group from your own phone, then `bash setup.sh groups off`.
 
 Then send `!testgroups` to the bot. **Expected:** a test line appears in all three groups.
 
@@ -142,6 +144,11 @@ bash setup.sh schedules
 | `!groups` | List the forwarding groups |
 | `!removegroup 2` | Stop forwarding to group 2 of that list |
 | `!testgroups` | Post a test line in the groups |
+| `!settings` | The numbers, accounts and amount in use, and how to change them |
+| `!add source 9847012345` / `!remove source …` | Another number whose reports get forwarded / stop forwarding from it |
+| `!set firm 9847012345` | Who sends the statements (`!set firm none` to clear) |
+| `!add account 1001 Asha` / `!remove account 1001` | Track another account separately / stop tracking it |
+| `!set keyword 4417` / `!set amount 2000` | A word the entry must contain / the daily amount |
 | `!reload` | Reload config.json (it also reloads by itself) |
 | `!help` | Command list |
 
@@ -151,11 +158,19 @@ bash setup.sh schedules
 
 ```
 Statement read (2 files from the firm)
-Covers: Thu 1 Oct – Wed 7 Oct (8 rows)
-Matching credits: 5 (₹10,000) · new 5, already had 0
-Credited on: 1, 3, 5, 6, 7 Oct
-⚠️ No credit on: Fri 2 Oct
-October 2026 so far: ₹10,000 from 5 credits
+
+Asha (A/C 1001) · Thu 1 Oct – Fri 16 Oct
+Matching credits: 13 (₹26,000) · new 13, already had 0
+Credited on: 1, 3, 5, 6, 7, 9 (×2), 10, 12, 13, 14, 15, 16 Oct
+⏰ Paid late: 8 Oct (on 9 Oct)
+✅ Every working day in this range has its credit.
+
+Ravi (A/C 1002) · Thu 1 Oct – Sat 17 Oct
+Matching credits: 13 (₹26,000) · new 13, already had 0
+⚠️ No credit on: Thu 1 Oct
+Other credits seen (not counted): 1 Oct ₹1,500 rent
+
+October 2026 so far: Asha ₹26,000 · Ravi ₹26,000 · together ₹52,000
 ```
 
 If a missing day was a holiday, send `!holiday` with that date and it drops off every report.
@@ -165,6 +180,8 @@ If a missing day was a holiday, send `!holiday` with that date and it drops off 
 Gemini only reads the rows (date, description, amount, credit or debit, reference, and which screenshot the row is on). The rules are plain code:
 
 - Only credits count, never debits. The amount must be exactly ₹2,000.
+- When accounts are set (`!add account 1001 Asha`), each row goes to the account printed in its statement's header, and each account gets its own check and total. Rows for other accounts are ignored and mentioned.
+- A day with two credits pays for the earliest earlier working day that had none, shown as "paid late" rather than missing (like the second ₹2,000 on 9 Oct marked "8-10").
 - If a keyword was given in setup, the entry must contain it.
 - The same entry seen twice (overlapping screenshots, the same week sent again) is recorded once.
 - A day counts as "checked" only if it is visible in a screenshot. Days between two screenshots that weren't shown are listed separately ("not in these screenshots"), not as missing.
@@ -178,6 +195,9 @@ Gemini only reads the rows (date, description, amount, credit or debit, referenc
 
 | Setting | Default | What it does |
 |---|---|---|
+| `forwarding.forward_kinds` | all four | Which files are forwarded: `image`, `document`, `video`, `audio`. `["image"]` = pictures only |
+| `forwarding.target_group_names` | `[]` | Group names `bash setup.sh groups` finds by itself (emoji and capitals don't matter) |
+| `statement.accounts` | `[]` | Accounts tracked separately, e.g. `[{"number": "1001", "name": "Asha"}]` |
 | `forwarding.caption_prefix` | `""` | Text put in front of the original caption, e.g. `"From office: "` |
 | `forwarding.notify_owner` | `"failures"` | `"always"` also confirms every forward; `"never"` stays quiet |
 | `forwarding.forward_text_messages` | `false` | `true` forwards plain text from the source number too |
@@ -203,8 +223,9 @@ Gemini only reads the rows (date, description, amount, credit or debit, referenc
 | `!status` gets no reply | `bash setup.sh status`. If WhatsApp isn't connected, `bash setup.sh pair` again. |
 | Files aren't forwarded | Check the source number with `!status`, then `!groups` and `!testgroups`. |
 | "Couldn't read the statement" | Usually the Gemini key or free quota. Fix the key with `bash setup.sh`, then `!retry`. |
-| A screenshot got a chat reply instead of being read | It was sent while Hermes was still answering you. Wait for the reply, then send it again. |
-| `!addgroup` does nothing | Run `bash setup.sh groups on` first and wait 20 seconds. If still nothing, send any message in the group, run `bash setup.sh logs`, and copy the `chat=...@g.us` ID into `target_groups` in `data/whatsapp-relay/config.json`. |
+| A screenshot got a chat reply instead of being read | It had a caption. Send statement screenshots with no caption (or start the caption with "statement"). |
+| A group isn't found | Run `bash setup.sh groups` again and type `!addgroup` inside that group from your phone. If still nothing, check the bot number is a member of it. Last resort: send any message in the group while `bash setup.sh groups on` is active, run `bash setup.sh logs`, and copy the `chat=...@g.us` ID into `target_groups` in `data/whatsapp-relay/config.json`. |
+| Files reach two groups but not the third | That group may let only admins send messages (common in Communities). Make the bot number an admin there, or allow all members to send. |
 | WhatsApp logged out | `bash setup.sh pair` and scan again from the bot phone. |
 | `docker compose` not found | Docker Compose isn't installed on the VPS; ask whoever manages the server. |
 
@@ -214,7 +235,7 @@ Everything lives in `data/` next to this README. Back up the whole agent by copy
 
 | Path (inside `data/`) | What |
 |---|---|
-| `whatsapp-relay/config.json` | Settings (numbers, keyword, amount) |
+| `whatsapp-relay/config.json` | Settings (numbers, groups, accounts, amount); `settings.json` from the zip is copied in here |
 | `whatsapp-relay/groups.json` | Groups added with `!addgroup` |
 | `whatsapp-relay/ledger.db` | The credits ledger |
 | `whatsapp-relay/statements/` | Every statement image received |

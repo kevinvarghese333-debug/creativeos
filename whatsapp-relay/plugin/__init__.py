@@ -36,12 +36,48 @@ async def _on_pre_gateway_dispatch(event=None, gateway=None, **kwargs):
         return None
 
 
+def _install_adapter_intercept() -> bool:
+    """Let the relay see each WhatsApp message as the adapter receives it.
+
+    The gateway hook alone misses bursts: while Hermes is still handling one message from a chat, the
+    adapter treats the next one from that chat as a follow-up, and drops it when the sender isn't an
+    allowed user (the source numbers and the firm never are) before any hook runs. So 4-5 report
+    screenshots sent together would lose all but the first. Wrapping the adapters' shared entry point
+    hands every WhatsApp message to the relay first; whatever it doesn't handle goes on unchanged,
+    and every other platform is untouched. If this Hermes version lacks that entry point, the gateway
+    hook still works for single messages."""
+    try:
+        from gateway.platforms.base import BasePlatformAdapter  # type: ignore
+    except Exception as exc:
+        logger.warning("[relay] adapter entry point not found (%s); using the gateway hook only", exc)
+        return False
+    original = BasePlatformAdapter.handle_message
+    if getattr(original, "_relay_wrapped", False):
+        return True
+
+    async def handle_message(self, event):
+        if str(getattr(getattr(self, "platform", None), "value", getattr(self, "platform", ""))).lower() == "whatsapp":
+            try:
+                if await _relay().handle(event, None, adapter=self):
+                    event._gateway_accepted = True
+                    return None
+            except Exception:
+                logger.exception("[relay] message handling failed; passing message on unchanged")
+        return await original(self, event)
+
+    handle_message._relay_wrapped = True
+    handle_message.__wrapped__ = original
+    BasePlatformAdapter.handle_message = handle_message
+    return True
+
+
 TOOL_SCHEMA = {
     "name": "deposit_tracker",
     "description": (
         "Look up the owner's daily deposit tracker, built from savings-account statement screenshots sent on "
-        "WhatsApp. Returns the month's total received, which working days were credited, which are missing, "
-        "which are not yet covered by any statement, and when the last statement arrived. Use it whenever the "
+        "WhatsApp. Returns, for each tracked account, the month's total received, which working days were "
+        "credited, which were paid late, which are missing, which are not yet covered by any statement, and when "
+        "the last statement arrived. Use it whenever the "
         "owner asks about the daily ₹2000 credits, deposits received, missing days or monthly totals."
     ),
     "parameters": {
@@ -62,6 +98,7 @@ def _tool_handler(params, **kwargs):
 
 
 def register(ctx):
+    _install_adapter_intercept()
     ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
     try:
         ctx.register_tool(name="deposit_tracker", toolset="whatsapp_relay", schema=TOOL_SCHEMA, handler=_tool_handler)

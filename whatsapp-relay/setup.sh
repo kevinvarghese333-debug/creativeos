@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # WhatsApp relay on Hermes: every setup step, run from the unzipped whatsapp-relay folder.
 #
-#   bash setup.sh               the setup questions (run again to change them; Enter keeps old answers)
+#   bash setup.sh               set up (uses settings.json when the package has one; asks for the Gemini key)
+#   bash setup.sh questions     answer the setup questions again (Enter keeps old answers)
 #   bash setup.sh pair          link the bot's WhatsApp by scanning a QR code
+#   bash setup.sh groups        find the forwarding groups by name, then stop looking at groups
 #   bash setup.sh groups on     let the bot see group messages, so !addgroup works
 #   bash setup.sh groups off    back to ignoring groups, once the groups are added
 #   bash setup.sh schedules     turn on the 7-day nudge and the month-end total
@@ -207,22 +209,34 @@ ask_key() {
 
 # ------------------------------------------------------------------ commands
 cmd_setup() {
+  local mode="${1:-}"
   need_docker
   mkdir -p "$DATA/whatsapp-relay"
   local OWNER="" SOURCE="" FIRM="" KEYWORD="" KEY
-  eval "$(py answers)"
   say "WhatsApp relay setup"
-  say "Numbers with country code (919847012345); a plain 10-digit mobile also works."
-  say "Press Enter to keep an answer shown in [brackets]."
+  py apply-settings
+  eval "$(py answers)"
+  if [[ -n "$OWNER" && "$mode" != "questions" ]]; then
+    # The numbers are already known (settings.json, or an earlier run): only the key is asked.
+    say ""
+    py summary | sed 's/^/  /'
+    say ""
+    say "To change these later, send !settings to the bot on WhatsApp (or run: bash setup.sh questions)."
+    say ""
+    KEY="$(ask_key "$(env_value GOOGLE_API_KEY)")"
+  else
+    say "Numbers with country code (919847012345); a plain 10-digit mobile also works."
+    say "Press Enter to keep an answer shown in [brackets]. Everything but your own number and the"
+    say "Gemini key can also be set later from WhatsApp (send !settings to the bot)."
+    say ""
+    OWNER="$(ask_number "1. Your own WhatsApp number" "$OWNER" required)"
+    SOURCE="$(ask_number "2. The source number (whose files get forwarded; Enter to skip)" "$SOURCE" optional)"
+    FIRM="$(ask_number "3. The firm's number (who sends the statements; Enter to skip)" "$FIRM" optional)"
+    KEYWORD="$(ask_keyword "$KEYWORD")"
+    KEY="$(ask_key "$(env_value GOOGLE_API_KEY)")"
+    py save --owner "$OWNER" --source "$SOURCE" --firm "$FIRM" --keyword "$KEYWORD"
+  fi
   say ""
-  OWNER="$(ask_number "1. Your own WhatsApp number" "$OWNER" required)"
-  SOURCE="$(ask_number "2. The source number (whose files get forwarded)" "$SOURCE" required)"
-  FIRM="$(ask_number "3. The firm's number (who sends the statements; Enter to skip)" "$FIRM" optional)"
-  KEYWORD="$(ask_keyword "$KEYWORD")"
-  KEY="$(ask_key "$(env_value GOOGLE_API_KEY)")"
-  say ""
-
-  py save --owner "$OWNER" --source "$SOURCE" --firm "$FIRM" --keyword "$KEYWORD"
   say "Saved $DATA/whatsapp-relay/config.json"
   install_files
   : >"$SETUP_LOG"
@@ -305,8 +319,59 @@ cmd_pair() {
 # Group messages normally never reach Hermes. "on" admits every group the bot is in (an allowlist of
 # "*"; Hermes refuses to start with group policy "open" unless every DM sender is allowed too). The
 # plugin keeps the bot silent in groups either way; it only acts on your own !addgroup.
+# "groups" with no word: open group messages, wait until the bot has found every group named in
+# target_group_names (it does when anyone posts in it), then close them again.
+cmd_groups_find() {
+  need_setup
+  local missing found_before now
+  missing="$(py missing-groups)"
+  if [[ -z "$(py group-names)" ]]; then
+    say "No group names are set, so add them by hand:"
+    say "  bash setup.sh groups on, then type !addgroup inside each group, then bash setup.sh groups off"
+    return 0
+  fi
+  if [[ -z "$missing" ]]; then
+    say "All groups are already found:"
+    py groups | sed 's/^/  /'
+    return 0
+  fi
+  step "Opening group messages" hx config set WHATSAPP_GROUP_ALLOWED_USERS '*'
+  step "Opening group messages" hx config set WHATSAPP_GROUP_POLICY allowlist
+  restart_container
+  say "Looking for these groups:"
+  printf '%s\n' "$missing" | sed 's/^/  /'
+  say "The bot finds a group as soon as anyone posts in it (or type !addgroup in it from your phone)."
+  say "It tells you on WhatsApp as each one is found. Leave this running; Ctrl+C stops waiting."
+  local stop=0 waited=0
+  trap 'stop=1' INT
+  found_before="$missing"
+  while [[ $stop == 0 && $waited -lt 3600 ]]; do
+    sleep 5 || true
+    waited=$((waited + 5))
+    now="$(py missing-groups)"
+    if [[ "$now" != "$found_before" ]]; then
+      comm -23 <(sort <<<"$found_before") <(sort <<<"$now") | sed 's/^/  ✅ Found: /'
+      found_before="$now"
+    fi
+    [[ -z "$now" ]] && break
+  done
+  trap - INT
+  step "Closing group messages" hx config set WHATSAPP_GROUP_POLICY pairing
+  hx config unset WHATSAPP_GROUP_ALLOWED_USERS >>"$SETUP_LOG" 2>&1 || true
+  restart_container
+  say "Stopped looking at group messages. Forwarding groups:"
+  py groups | sed 's/^/  /'
+  now="$(py missing-groups)"
+  if [[ -n "$now" ]]; then
+    say "Not found yet: $(paste -sd, <<<"$now" | sed 's/,/, /g'). Run 'bash setup.sh groups' again later."
+  else
+    say "Send !testgroups to the bot to check they all receive messages."
+  fi
+}
+
 cmd_groups() {
   case "${1:-}" in
+    "") cmd_groups_find ;;
     on)
       need_setup
       step "Opening group messages" hx config set WHATSAPP_GROUP_ALLOWED_USERS '*'
@@ -324,7 +389,7 @@ cmd_groups() {
       py groups | sed 's/^/  /'
       say "Send !testgroups to the bot to check they all receive messages."
       ;;
-    *) die "Use: bash setup.sh groups on   (or: bash setup.sh groups off)" ;;
+    *) die "Use: bash setup.sh groups   (or: bash setup.sh groups on / off)" ;;
   esac
 }
 
@@ -420,10 +485,11 @@ cmd_update() {
   cmd_status
 }
 
-usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-}" in
   "") cmd_setup ;;
+  questions) cmd_setup questions ;;
   pair) cmd_pair ;;
   groups) cmd_groups "${2:-}" ;;
   schedules) cmd_schedules ;;

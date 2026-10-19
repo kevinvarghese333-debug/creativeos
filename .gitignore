@@ -1,7 +1,9 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
 dist/
 # Created on the server by setup.sh: settings, the WhatsApp link, the ledger. Never commit it.
 whatsapp-relay/data/
-.ruff_cache/
+# A personal settings file (phone numbers, accounts). It goes into one person's zip, not into git.
+whatsapp-relay/settings.json

@@ -35,6 +35,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "source_numbers": [],
         "target_groups": [],
+        # Group names to find by themselves (while `bash setup.sh groups` runs), e.g. "AREA MANAGERS".
+        "target_group_names": [],
+        # Which files are forwarded: image, document, video, audio. A picture sent "as a document" counts as image.
+        "forward_kinds": ["image", "document", "video", "audio"],
         "forward_text_messages": False,
         "caption_prefix": "",
         "notify_owner": "failures",
@@ -43,6 +47,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "statement": {
         "enabled": True,
         "sender_numbers": [],
+        # Accounts tracked separately, e.g. [{"number": "1001", "name": "Asha"}]. Empty = one combined tracker.
+        "accounts": [],
         "expected_amount": 2000,
         "amount_tolerance": 0,
         "match_keywords": [],
@@ -92,15 +98,26 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
-def load_config(home: Optional[Path] = None) -> dict:
+def read_user_config(home: Optional[Path] = None) -> dict:
+    """config.json as written (no defaults merged in); {} when it does not exist yet."""
     path = data_dir(home) / "config.json"
-    user: dict = {}
-    if path.exists():
-        text = path.read_text(encoding="utf-8")
-        # Allow // comments so the example file can explain itself.
-        text = re.sub(r"^\s*//.*$", "", text, flags=re.MULTILINE)
-        user = json.loads(text) if text.strip() else {}
-    return _deep_merge(DEFAULT_CONFIG, user)
+    if not path.exists():
+        return {}
+    # Allow // comments so the example file can explain itself.
+    text = re.sub(r"^\s*//.*$", "", path.read_text(encoding="utf-8"), flags=re.MULTILINE)
+    return json.loads(text) if text.strip() else {}
+
+
+def save_user_config(cfg: dict, home: Optional[Path] = None) -> Path:
+    path = data_dir(home) / "config.json"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def load_config(home: Optional[Path] = None) -> dict:
+    return _deep_merge(DEFAULT_CONFIG, read_user_config(home))
 
 
 def digits(value: Any) -> str:
@@ -158,6 +175,10 @@ def fmt_day(d: date) -> str:
     return f"{d.strftime('%a')} {d.day} {d.strftime('%b')}"
 
 
+def fmt_short(d: date) -> str:
+    return f"{d.day} {d.strftime('%b')}"
+
+
 def fmt_days(days: Iterable[date], limit: int = 12) -> str:
     days = sorted(days)
     if not days:
@@ -185,8 +206,77 @@ def parse_iso(value: Any) -> Optional[date]:
         return None
 
 
+def group_key(name: str) -> str:
+    """'AREA MANAGERS ♻️⚧️' -> 'area managers', '🎯MANAGERS🎯' -> 'managers' (emoji and symbols dropped)."""
+    return " ".join(re.sub(r"[^\w\s]|_", " ", str(name or "").lower()).split())
+
+
 def norm_text(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+# --------------------------------------------------------------------------- accounts
+
+def account_key(value: Any) -> str:
+    """'SB A/C-1,001.00', '1001' or 'XXXX1001' -> '1001': the account number's digits, minus a trailing .00."""
+    s = re.sub(r"[,\s]", "", str(value or ""))
+    s = re.sub(r"\.0+(?=\D|$)", "", s)
+    return re.sub(r"\D", "", s)
+
+
+def tracked_accounts(cfg: dict) -> list[dict]:
+    """statement.accounts as [{"number": "1001", "name": "Asha"}]; [] = one combined tracker."""
+    out = []
+    for a in cfg.get("statement", {}).get("accounts") or []:
+        if isinstance(a, (str, int)):
+            a = {"number": str(a)}
+        if isinstance(a, dict):
+            number = account_key(a.get("number"))
+            if number and number not in [x["number"] for x in out]:
+                out.append({"number": number, "name": str(a.get("name") or "").strip() or f"A/C {number}"})
+    return out
+
+
+def match_account(read_value: Any, accounts: list[dict]) -> Optional[str]:
+    """The tracked account number a statement's printed account belongs to, or None."""
+    key = account_key(read_value)
+    if not key:
+        return None
+    for a in accounts:
+        n = a["number"]
+        if key == n or (len(key) >= 3 and len(n) >= 3 and (key.endswith(n) or n.endswith(key))):
+            return n
+    return None
+
+
+def settle_days(start: date, end: date, counts: dict, expected: set, shown: set) -> tuple[list, list]:
+    """Walk start..end: each expected day takes one of its own credits, and any extra credit pays the
+    earliest unpaid shown day before it. Returns (days still unpaid, [(missed day, day paid)])."""
+    unpaid: list[date] = []
+    late: list[tuple[date, date]] = []
+    d = start
+    while d <= end:
+        n = counts.get(d, 0)
+        if d in expected:
+            if n:
+                n -= 1
+            elif d in shown:
+                unpaid.append(d)
+        while n and unpaid:
+            late.append((unpaid.pop(0), d))
+            n -= 1
+        d += timedelta(days=1)
+    return unpaid, late
+
+
+def fmt_day_counts(counts: dict) -> str:
+    """{9 Oct: 2, 10 Oct: 1} -> '9 (×2), 10 Oct'."""
+    days = sorted(counts)
+    if not days:
+        return "none"
+    one_month = len({(d.year, d.month) for d in days}) == 1
+    parts = [(str(d.day) if one_month else fmt_short(d)) + (f" (×{counts[d]})" if counts[d] > 1 else "") for d in days]
+    return ", ".join(parts) + (f" {days[0].strftime('%b')}" if one_month else "")
 
 
 # --------------------------------------------------------------------------- database
@@ -213,13 +303,15 @@ CREATE TABLE IF NOT EXISTS credits (
     reference     TEXT,
     dedupe_key    TEXT UNIQUE,
     statement_id  INTEGER,
-    added_at      TEXT NOT NULL
+    added_at      TEXT NOT NULL,
+    account       TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS credits_date ON credits(entry_date);
 CREATE TABLE IF NOT EXISTS coverage (
     statement_id  INTEGER NOT NULL,
     day_from      TEXT NOT NULL,
-    day_to        TEXT NOT NULL
+    day_to        TEXT NOT NULL,
+    account       TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS coverage_range ON coverage(day_from, day_to);
 CREATE TABLE IF NOT EXISTS holidays (
@@ -234,12 +326,18 @@ CREATE TABLE IF NOT EXISTS meta (
 
 
 class Ledger:
+    """Credits are stored per account ('' when no accounts are configured). Every query that takes
+    ``account=None`` covers all accounts."""
+
     def __init__(self, db_path: Path, cfg: dict):
         self.db_path = Path(db_path)
         self.cfg = cfg
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as c:
             c.executescript(SCHEMA)
+            for table in ("credits", "coverage"):  # ledgers made before accounts existed
+                if "account" not in {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN account TEXT NOT NULL DEFAULT ''")
             if self.get_meta("installed_at", conn=c) is None:
                 self.set_meta("installed_at", now_local(cfg).isoformat(), conn=c)
 
@@ -264,6 +362,9 @@ class Ledger:
             raise
         finally:
             conn.close()
+
+    def accounts(self) -> list[dict]:
+        return tracked_accounts(self.cfg)
 
     # ---------------------------------------------------------------- meta
     def get_meta(self, key: str, default: Optional[str] = None, conn=None) -> Optional[str]:
@@ -325,8 +426,9 @@ class Ledger:
     # ---------------------------------------------------------------- statements + credits
     def add_statement(self, *, sender: str, files: list[str], covered_from: Optional[date],
                       covered_to: Optional[date], transactions: int, raw: Any,
-                      ranges: Optional[list[tuple[date, date]]] = None) -> int:
-        """``ranges`` = the date spans actually visible (one per screenshot); defaults to from..to."""
+                      ranges: Optional[list[tuple]] = None) -> int:
+        """``ranges`` = the date spans actually visible, one per screenshot, as (from, to) or
+        (from, to, account); defaults to from..to."""
         if ranges is None and covered_from and covered_to:
             ranges = [(covered_from, covered_to)]
         with self._conn() as c:
@@ -339,9 +441,9 @@ class Ledger:
                  transactions, 0, 0, json.dumps(raw, ensure_ascii=False, default=str)[:200000]),
             )
             sid = int(cur.lastrowid)
-            for a, b in ranges or []:
-                c.execute("INSERT INTO coverage(statement_id, day_from, day_to) VALUES(?,?,?)",
-                          (sid, a.isoformat(), b.isoformat()))
+            for a, b, *acct in ranges or []:
+                c.execute("INSERT INTO coverage(statement_id, day_from, day_to, account) VALUES(?,?,?,?)",
+                          (sid, a.isoformat(), b.isoformat(), acct[0] if acct else ""))
             return sid
 
     def finish_statement(self, statement_id: int, matched: int, added: int) -> None:
@@ -349,22 +451,23 @@ class Ledger:
             c.execute("UPDATE statements SET matched=?, added=? WHERE id=?", (matched, added, statement_id))
 
     @staticmethod
-    def dedupe_key(d: date, amount: float, reference: str, description: str) -> str:
+    def dedupe_key(d: date, amount: float, reference: str, description: str, account: str = "") -> str:
         ref = norm_text(reference)
         basis = f"ref:{ref}" if len(ref) >= 4 else f"desc:{norm_text(description)}"
-        return f"{d.isoformat()}|{amount:.2f}|{basis}"
+        key = f"{d.isoformat()}|{amount:.2f}|{basis}"
+        return f"{account}|{key}" if account else key
 
     def add_credit(self, *, d: date, amount: float, description: str, reference: str,
-                   statement_id: Optional[int]) -> bool:
+                   statement_id: Optional[int], account: str = "") -> bool:
         """Insert a matched credit. Returns False when it is already recorded."""
-        key = self.dedupe_key(d, amount, reference, description)
+        key = self.dedupe_key(d, amount, reference, description, account)
         with self._conn() as c:
             if c.execute("SELECT 1 FROM credits WHERE dedupe_key=?", (key,)).fetchone():
                 return False
-            # Same day + same amount with near-identical text = the same entry read twice
+            # Same day + amount + account with near-identical text = the same entry read twice
             # (overlapping screenshots, slightly different OCR).
-            for row in c.execute("SELECT description, reference FROM credits WHERE entry_date=? AND ABS(amount-?)<0.01",
-                                 (d.isoformat(), amount)):
+            for row in c.execute("SELECT description, reference FROM credits WHERE entry_date=? AND ABS(amount-?)<0.01"
+                                 " AND account=?", (d.isoformat(), amount, account)):
                 ref_a, ref_b = norm_text(row["reference"]), norm_text(reference)
                 if ref_a and ref_b and len(ref_a) >= 4 and len(ref_b) >= 4:
                     if ref_a == ref_b:
@@ -374,9 +477,10 @@ class Ledger:
                 if ratio >= 0.8:
                     return False
             c.execute(
-                "INSERT INTO credits(entry_date, amount, description, reference, dedupe_key, statement_id, added_at)"
-                " VALUES(?,?,?,?,?,?,?)",
-                (d.isoformat(), amount, description, reference, key, statement_id, now_local(self.cfg).isoformat()),
+                "INSERT INTO credits(entry_date, amount, description, reference, dedupe_key, statement_id, added_at,"
+                " account) VALUES(?,?,?,?,?,?,?,?)",
+                (d.isoformat(), amount, description, reference, key, statement_id, now_local(self.cfg).isoformat(),
+                 account),
             )
             return True
 
@@ -400,18 +504,20 @@ class Ledger:
         except ValueError:
             return None
 
-    def credits_between(self, start: date, end: date) -> list[sqlite3.Row]:
+    def credits_between(self, start: date, end: date, account: Optional[str] = None) -> list[sqlite3.Row]:
+        sql, args = "SELECT * FROM credits WHERE entry_date BETWEEN ? AND ?", [start.isoformat(), end.isoformat()]
+        if account is not None:
+            sql, args = sql + " AND account=?", args + [account]
         with self._conn() as c:
-            return list(c.execute(
-                "SELECT * FROM credits WHERE entry_date BETWEEN ? AND ? ORDER BY entry_date, id",
-                (start.isoformat(), end.isoformat())))
+            return list(c.execute(sql + " ORDER BY entry_date, id", args))
 
-    def covered_days(self, start: date, end: date) -> set[date]:
+    def covered_days(self, start: date, end: date, account: Optional[str] = None) -> set[date]:
+        sql, args = "SELECT day_from, day_to FROM coverage WHERE day_to >= ? AND day_from <= ?", [start.isoformat(), end.isoformat()]
+        if account is not None:
+            sql, args = sql + " AND account=?", args + [account]
         covered: set[date] = set()
         with self._conn() as c:
-            rows = list(c.execute(
-                "SELECT day_from, day_to FROM coverage WHERE day_to >= ? AND day_from <= ?",
-                (start.isoformat(), end.isoformat())))
+            rows = list(c.execute(sql, args))
         for r in rows:
             a, b = parse_iso(r["day_from"]), parse_iso(r["day_to"])
             if not a or not b:
@@ -423,41 +529,78 @@ class Ledger:
         return covered
 
     # ---------------------------------------------------------------- reports
-    def month_summary(self, year: int, month: int, today: Optional[date] = None) -> dict:
+    def month_summary(self, year: int, month: int, today: Optional[date] = None,
+                      account: Optional[str] = None) -> dict:
+        """One account's month (``account=None``: all accounts together).
+
+        A day with more than one credit pays for the earliest unpaid working day before it, so a
+        missed day settled the next day shows as paid late rather than missing."""
         today = today or now_local(self.cfg).date()
         first = date(year, month, 1)
         last = date(year, month, calendar.monthrange(year, month)[1])
-        rows = self.credits_between(first, last)
-        credited_days = {parse_iso(r["entry_date"]) for r in rows}
+        rows = self.credits_between(first, last, account)
+        counts: dict[date, int] = {}
+        for r in rows:
+            d = parse_iso(r["entry_date"])
+            if d:
+                counts[d] = counts.get(d, 0) + 1
         expected = self.working_days(first, last)
-        covered = self.covered_days(first, last)
+        expected_set = set(expected)
+        covered = self.covered_days(first, last, account)
         upto = min(last, today)
-        missing = [d for d in expected if d <= upto and d in covered and d not in credited_days]
-        pending = [d for d in expected if d <= upto and d not in covered and d not in credited_days]
+        unpaid, late = settle_days(first, upto, counts, expected_set, covered)
+        pending = [d for d in expected if d <= upto and d not in covered and d not in counts]
         last_expected = expected[-1] if expected else None
-        complete = bool(last_expected) and all(d in covered or d in credited_days for d in expected)
+        complete = bool(last_expected) and all(d in covered or d in counts for d in expected)
         # The final total goes out once the month's last working day is in a statement, even when
         # earlier days never were (setup mid-month); the report lists those days.
-        last_day_in = bool(last_expected) and (last_expected in covered or last_expected in credited_days)
+        last_day_in = bool(last_expected) and (last_expected in covered or last_expected in counts)
+        name = next((a["name"] for a in self.accounts() if a["number"] == account), "") if account else ""
         return {
-            "year": year, "month": month, "label": month_name(year, month),
+            "year": year, "month": month, "label": month_name(year, month), "account": account, "name": name,
             "total": round(sum(float(r["amount"]) for r in rows), 2),
             "count": len(rows),
-            "credited_days": sorted(d for d in credited_days if d),
+            "credited_days": sorted(counts),
+            "day_counts": counts,
             "expected_days": expected,
             "expected_so_far": [d for d in expected if d <= upto],
-            "missing": missing,
+            "missing": unpaid,
+            "late": late,
             "pending": pending,
             "complete": complete,
             "last_day_in": last_day_in,
             "last_expected": last_expected,
         }
 
+    def month_summaries(self, year: int, month: int, today: Optional[date] = None) -> list[dict]:
+        """One summary per tracked account, or a single combined one when none are configured."""
+        accounts = self.accounts()
+        if not accounts:
+            return [self.month_summary(year, month, today)]
+        return [self.month_summary(year, month, today, a["number"]) for a in accounts]
+
+    def last_day_in(self, year: int, month: int, today: Optional[date] = None) -> bool:
+        return all(s["last_day_in"] for s in self.month_summaries(year, month, today))
+
     def month_report(self, year: int, month: int, *, final: bool = False, today: Optional[date] = None) -> str:
-        s = self.month_summary(year, month, today=today)
+        summaries = self.month_summaries(year, month, today)
+        title = f"**{'Final total' if final else 'Deposit report'}: {summaries[0]['label']}**"
+        lines = [title]
+        for s in summaries:
+            if len(summaries) > 1 or s["account"]:
+                lines.append("")
+                lines.append(f"**{s['name']}** (A/C {s['account']})")
+            lines += self._report_lines(s)
+        if len(summaries) > 1:
+            total = sum(s["total"] for s in summaries)
+            lines += ["", f"Together: **{inr(total)}** from {sum(s['count'] for s in summaries)} credits"]
+        if any(s["missing"] for s in summaries):
+            lines.append("If any of those were holidays, send *!holiday YYYY-MM-DD* and they drop off.")
+        return "\n".join(lines)
+
+    def _report_lines(self, s: dict) -> list[str]:
         exp = self.cfg.get("statement", {}).get("expected_amount")
-        title = f"**{'Final total' if final else 'Deposit report'}: {s['label']}**"
-        lines = [title, f"Received: **{inr(s['total'])}** from {s['count']} credit{'s' if s['count'] != 1 else ''}"]
+        lines = [f"Received: **{inr(s['total'])}** from {s['count']} credit{'s' if s['count'] != 1 else ''}"]
         so_far = s["expected_so_far"]
         if so_far:
             whole_month = len(so_far) == len(s["expected_days"])
@@ -469,15 +612,15 @@ class Ledger:
                 short = float(exp) * len(so_far) - s["total"]
                 if whole_month and s["complete"] and abs(short) >= 0.01:
                     lines.append(f"{'Short by' if short > 0 else 'Extra'}: {inr(abs(short))}")
+        if s["late"]:
+            lines.append("⏰ Paid late: " + ", ".join(f"{fmt_short(a)} (on {fmt_short(b)})" for a, b in s["late"]))
         if s["missing"]:
             lines.append(f"⚠️ No credit on: {fmt_days(s['missing'])}")
         if s["pending"]:
             lines.append(f"⏳ Not in any statement yet: {fmt_days(s['pending'])}")
         if not s["missing"] and not s["pending"] and so_far:
             lines.append("✅ Every working day so far is accounted for.")
-        if s["missing"]:
-            lines.append("If any of those were holidays, send *!holiday YYYY-MM-DD* and they drop off.")
-        return "\n".join(lines)
+        return lines
 
 
 def last_day_of_month(d: date) -> date:
