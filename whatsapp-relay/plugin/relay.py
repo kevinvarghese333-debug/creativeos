@@ -504,6 +504,7 @@ class Relay:
         if batch is None:
             batch = self.batches[key] = Batch(sender=sender)
         batch.files.extend(files)
+        logger.info("[relay] statement file from %s queued (%d in this batch)", sender, len(batch.files))
         if batch.timer is not None and not batch.timer.done():
             batch.timer.cancel()
         wait = float(self.cfg["statement"].get("batch_seconds") or 0)
@@ -553,6 +554,7 @@ class Relay:
     async def process_batch(self, batch: Batch) -> None:
         today = L.now_local(self.cfg).date()
         gem = self.cfg.get("gemini", {})
+        logger.info("[relay] reading %d statement file(s) from %s", len(batch.files), batch.sender)
         try:
             result = await X.extract(batch.files, model=gem.get("model") or "gemini-flash-latest", today=today,
                                      hint=self.hint(), timeout=float(gem.get("timeout_seconds") or 120),
@@ -567,9 +569,18 @@ class Relay:
             logger.exception("[relay] statement processing crashed")
             await self.notify_owner(f"⚠️ Statement processing hit an error: {exc}\nSend *!retry* to try again.")
             return
-        outcome = self.apply_result(result, batch.sender, [p for p, _ in batch.files], today=today)
-        await self.notify_owner(self.format_outcome(outcome, len(batch.files), batch.sender))
-        for report in self.final_reports(outcome.get("months", []), today=today):
+        try:
+            outcome = self.apply_result(result, batch.sender, [p for p, _ in batch.files], today=today)
+            reply = self.format_outcome(outcome, len(batch.files), batch.sender)
+            reports = self.final_reports(outcome.get("months", []), today=today)
+        except Exception as exc:  # a reading the rules can't handle must still get an answer
+            self.last_failed = batch
+            logger.exception("[relay] statement processing crashed")
+            await self.notify_owner(f"⚠️ Statement processing hit an error: {exc}\nSend *!retry* to try again.")
+            return
+        logger.info("[relay] statement from %s read", batch.sender)
+        await self.notify_owner(reply)
+        for report in reports:
             await self.notify_owner(report)
 
     def matches(self, txn: dict) -> bool:

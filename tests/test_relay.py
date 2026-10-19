@@ -269,6 +269,18 @@ def test_firm_statement_confirmation(relay, home, gemini):
     assert "4417" in gemini.calls[0][1]["hint"]
 
 
+def test_unexpected_reading_still_gets_an_answer(relay, home, gemini, monkeypatch):
+    gemini.will_return([row(12)])
+
+    def broken(*a, **kw):
+        raise ValueError("odd row")
+    monkeypatch.setattr(relay, "apply_result", broken)
+    statement_from(relay, home, sender=OWNER)
+    (msg,) = relay.adapter_obj.texts_to(jid(OWNER))
+    assert "Statement processing hit an error: odd row" in msg and "!retry" in msg
+    assert relay.last_failed is not None
+
+
 def test_screenshots_batched_into_one_call(relay, home, gemini, monkeypatch):
     write_config(home, statement__batch_seconds=0.3, statement__sender_numbers=[FIRM], statement__match_keywords=[])
     relay.reload()
