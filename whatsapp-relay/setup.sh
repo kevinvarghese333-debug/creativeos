@@ -269,6 +269,17 @@ cmd_setup() {
   fi
 }
 
+# WhatsApp ignores what you type from the bot's own account, so the owner must be another number.
+warn_if_linked_to_owner() {
+  local linked owner
+  linked="$(py linked-number 2>/dev/null || true)"
+  owner="$(py owner 2>/dev/null || true)"
+  [[ -n "$linked" && "$linked" == "$owner" ]] || return 0
+  say "⚠️  The bot is linked to your own number ($owner), so it ignores everything you type (!status, !addgroup)."
+  say "   Your number must be the phone you message the bot from. Run 'bash setup.sh questions' and change"
+  say "   answer 1 (press Enter for the rest), or link the bot's own WhatsApp instead: bash setup.sh pair"
+}
+
 whatsapp_health() {  # prints the bridge's connection state, or nothing
   docker exec "$CONTAINER" curl -fsS --max-time 3 http://127.0.0.1:3000/health 2>/dev/null \
     | sed -n 's/.*"status":"\([a-z_]*\)".*/\1/p' || true
@@ -310,6 +321,7 @@ cmd_pair() {
   local state; state="$(wait_whatsapp)"
   if [[ "$state" == "connected" ]]; then
     say "✅ WhatsApp connected."
+    warn_if_linked_to_owner
     say "Next: from your own phone, send !status to the bot number."
   else
     say "WhatsApp is linked but shows '$state' so far. Give it a minute, then: bash setup.sh status"
@@ -437,7 +449,7 @@ cmd_status() {
   else
     local wa; wa="$(whatsapp_health)"
     case "$wa" in
-      connected) say "WhatsApp: connected" ;;
+      connected) say "WhatsApp: connected"; warn_if_linked_to_owner ;;
       "") say "WhatsApp: bridge not running yet (it can take a minute after a restart) → bash setup.sh logs" ;;
       *) say "WhatsApp: $wa → if it stays like this, bash setup.sh pair" ;;
     esac
@@ -453,7 +465,7 @@ cmd_status() {
     say "Forwarding groups: $(grep -c . <<<"$groups")"
     printf '%s\n' "$groups" | sed 's/^/  /'
   else
-    say "Forwarding groups: none yet → bash setup.sh groups on, then !addgroup in each group"
+    say "Forwarding groups: none yet → bash setup.sh groups"
   fi
   if [[ "$(env_value WHATSAPP_GROUP_ALLOWED_USERS)" == "*" && "$(env_value WHATSAPP_GROUP_POLICY)" != "pairing" ]]; then
     say "Group messages: ON (run 'bash setup.sh groups off' once the groups are added)"

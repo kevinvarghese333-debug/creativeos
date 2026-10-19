@@ -118,6 +118,14 @@ def test_helper_reads_commented_config_and_lists_groups(tmp_path):
     assert "KEYWORD=''" in helper(tmp_path, "answers")
 
 
+def test_helper_linked_number(tmp_path):
+    assert helper(tmp_path, "linked-number").strip() == ""
+    session = tmp_path / "whatsapp" / "session"
+    session.mkdir(parents=True)
+    (session / "creds.json").write_text(json.dumps({"me": {"id": "919800000001:7@s.whatsapp.net", "lid": "1234:7@lid"}}))
+    assert helper(tmp_path, "linked-number").strip() == "919800000001"
+
+
 def test_helper_reports_broken_json(tmp_path):
     d = tmp_path / "whatsapp-relay"
     d.mkdir()

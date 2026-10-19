@@ -77,6 +77,11 @@ def phone(value: Any) -> str:
     return d if len(d) >= 8 else ""  # placeholders like 91XXXXXXXXXX count as "not set"
 
 
+def plain_name(name: Any) -> str:
+    """A WhatsApp profile name without the ~ * _ ` that WhatsApp would show as strike/bold/italic/code."""
+    return re.sub(r"[~*_`]+", "", str(name or "")).strip()
+
+
 def jid_for(number: str) -> str:
     n = str(number or "").strip()
     if "@" in n:
@@ -403,7 +408,7 @@ class Relay:
     async def forward(self, event: Any, raw: dict, source: Any) -> None:
         fwd = self.cfg["forwarding"]
         groups = [g["id"] for g in self.target_groups()]
-        sender = getattr(source, "user_name", None) or raw.get("senderName") or "source"
+        sender = plain_name(getattr(source, "user_name", None) or raw.get("senderName")) or "source"
         media = self._media(event)
         caption = self._caption(raw, event)
         prefix = str(fwd.get("caption_prefix") or "")
@@ -421,7 +426,8 @@ class Relay:
 
         if not groups:
             await self.notify_owner(f"A file from {sender} arrived, but no forwarding groups are set yet, so nothing was forwarded.\n"
-                                    "Run `bash setup.sh groups on`, then type !addgroup inside each group.", source)
+                                    "Add this number to each group, run `bash setup.sh groups` on the server, "
+                                    "then type !addgroup inside each group from your phone.", source)
             return
         if adapter is None:
             logger.error("[relay] no WhatsApp adapter, cannot forward")

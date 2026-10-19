@@ -224,6 +224,7 @@ Gemini only reads the rows (date, description, amount, credit or debit, referenc
 | Files aren't forwarded | Check the source number with `!status`, then `!groups` and `!testgroups`. |
 | "Couldn't read the statement" | Usually the Gemini key or free quota. Fix the key with `bash setup.sh`, then `!retry`. |
 | A screenshot got a chat reply instead of being read | It had a caption. Send statement screenshots with no caption (or start the caption with "statement"). |
+| The bot's messages land in your "Message yourself" chat, and `!status` gets no answer | The bot is linked to your own number. WhatsApp hides what you type from the bot's own account, so your number must be a different phone. Run `bash setup.sh questions`, type your other number at question 1 and press Enter for the rest. `bash setup.sh status` warns about this. |
 | A group isn't found | Run `bash setup.sh groups` again and type `!addgroup` inside that group from your phone. If still nothing, check the bot number is a member of it. Last resort: send any message in the group while `bash setup.sh groups on` is active, run `bash setup.sh logs`, and copy the `chat=...@g.us` ID into `target_groups` in `data/whatsapp-relay/config.json`. |
 | Files reach two groups but not the third | That group may let only admins send messages (common in Communities). Make the bot number an admin there, or allow all members to send. |
 | WhatsApp logged out | `bash setup.sh pair` and scan again from the bot phone. |

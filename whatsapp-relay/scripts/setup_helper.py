@@ -137,6 +137,19 @@ def cmd_owner(data: Path) -> None:
     print(phone(L.read_user_config(data).get("owner_number")))
 
 
+def cmd_linked_number(data: Path) -> None:
+    """The phone number of the WhatsApp account the bot is linked to (empty before pairing)."""
+    for path in (data / "whatsapp" / "session" / "creds.json", data / "platforms" / "whatsapp" / "session" / "creds.json"):
+        try:
+            me = json.loads(path.read_text(encoding="utf-8")).get("me") or {}
+        except (OSError, ValueError, AttributeError):
+            continue
+        number = L.digits(str(me.get("id") or "").split("@", 1)[0].split(":", 1)[0])
+        if number:
+            print(number)
+            return
+
+
 def group_list(data: Path) -> list[tuple[str, str]]:
     """(id, name) for every forwarding group: config.json target_groups, then groups.json."""
     cfg = merged(data)
@@ -179,7 +192,8 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True, type=Path)
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("apply-settings", "summary", "answers", "owner", "groups", "group-names", "missing-groups"):
+    for name in ("apply-settings", "summary", "answers", "owner", "linked-number", "groups", "group-names",
+                 "missing-groups"):
         sub.add_parser(name)
     save = sub.add_parser("save")
     save.add_argument("--owner", required=True)
@@ -188,7 +202,8 @@ def main(argv: list[str]) -> int:
     save.add_argument("--keyword", default="")
     args = parser.parse_args(argv)
     commands = {"apply-settings": cmd_apply_settings, "summary": cmd_summary, "answers": cmd_answers,
-                "owner": cmd_owner, "groups": cmd_groups, "group-names": cmd_group_names,
+                "owner": cmd_owner, "linked-number": cmd_linked_number, "groups": cmd_groups,
+                "group-names": cmd_group_names,
                 "missing-groups": cmd_missing_groups}
     try:
         if args.cmd == "save":

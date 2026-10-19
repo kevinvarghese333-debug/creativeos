@@ -101,7 +101,15 @@ def test_failed_send_reported(relay, home):
 def test_no_groups_yet(relay, home):
     drive(relay, event(SOURCE, "", media=[(media_file(home, "img_1.jpg"), "image/jpeg")], media_type="image"))
     (msg,) = relay.adapter_obj.texts_to(jid(OWNER))
-    assert "no forwarding groups" in msg and "!addgroup" in msg
+    assert "no forwarding groups" in msg and "bash setup.sh groups`" in msg and "!addgroup" in msg
+
+
+def test_sender_name_formatting_is_dropped(relay, home):
+    ev = event(SOURCE, "", media=[(media_file(home, "img_1.jpg"), "image/jpeg")], media_type="image")
+    ev.source.user_name = "~Asha K~❤️"
+    drive(relay, ev)
+    (msg,) = relay.adapter_obj.texts_to(jid(OWNER))
+    assert "A file from Asha K❤️ arrived" in msg
 
 
 def test_notify_always_and_caption_prefix(relay, home):
